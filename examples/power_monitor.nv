@@ -79,7 +79,7 @@ fn main() [hw]
                 field(" mV ", b.percent ?? 0)
                 hal.uart.write(" %  charge ")
                 hal.uart.write(phase(b.charge))
-            None => hal.uart.write("bat none")
+            None    => hal.uart.write("bat none")
         field("  vbus ", pmu.vbus_millivolts() ?? 0)
         field(" mV  die ", pmu.die_temp() ?? 0)
         hal.uart.write(" mC\n")

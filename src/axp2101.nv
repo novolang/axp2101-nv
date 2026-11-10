@@ -69,51 +69,51 @@ use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, PowerSource, Batt
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let REG_STATUS1  = 0x00
-let REG_STATUS2  = 0x01
-let REG_CHIP_ID  = 0x03
-let REG_COMMON   = 0x10
-let REG_CHG_CTRL = 0x18
-let REG_WDT_CTRL = 0x19
-let REG_LOW_BAT  = 0x1A
+let REG_STATUS1   = 0x00
+let REG_STATUS2   = 0x01
+let REG_CHIP_ID   = 0x03
+let REG_COMMON    = 0x10
+let REG_CHG_CTRL  = 0x18
+let REG_WDT_CTRL  = 0x19
+let REG_LOW_BAT   = 0x1A
 let REG_PWROFF_EN = 0x22
 let REG_KEY_LEVEL = 0x27
-let REG_ADC_EN   = 0x30
-let REG_ADC_VBAT = 0x34
-let REG_ADC_TS   = 0x36
-let REG_ADC_VBUS = 0x38
-let REG_ADC_VSYS = 0x3A
-let REG_ADC_TDIE = 0x3C
-let REG_IRQ_EN   = 0x40
-let REG_IRQ_ST   = 0x48
-let REG_TS_CTRL  = 0x50
-let REG_IPRECHG  = 0x61
-let REG_ICC      = 0x62
-let REG_ITERM    = 0x63
-let REG_CV       = 0x64
-let REG_BTN_CV   = 0x6A
-let REG_DCDC_EN  = 0x80
-let REG_LDO_EN0  = 0x90
-let REG_LDO_EN1  = 0x91
-let REG_BAT_PCT  = 0xA4
+let REG_ADC_EN    = 0x30
+let REG_ADC_VBAT  = 0x34
+let REG_ADC_TS    = 0x36
+let REG_ADC_VBUS  = 0x38
+let REG_ADC_VSYS  = 0x3A
+let REG_ADC_TDIE  = 0x3C
+let REG_IRQ_EN    = 0x40
+let REG_IRQ_ST    = 0x48
+let REG_TS_CTRL   = 0x50
+let REG_IPRECHG   = 0x61
+let REG_ICC       = 0x62
+let REG_ITERM     = 0x63
+let REG_CV        = 0x64
+let REG_BTN_CV    = 0x6A
+let REG_DCDC_EN   = 0x80
+let REG_LDO_EN0   = 0x90
+let REG_LDO_EN1   = 0x91
+let REG_BAT_PCT   = 0xA4
 
 // The value of the identification register.
 let CHIP_ID = 0x4A
 
 // STATUS1 and STATUS2.
-let ST1_VBUS_GOOD = 0x20
-let ST1_BATFET    = 0x10
+let ST1_VBUS_GOOD   = 0x20
+let ST1_BATFET      = 0x10
 let ST1_BAT_PRESENT = 0x08
 
 // COMMON.
-let COMMON_RESTART = 0x02
+let COMMON_RESTART  = 0x02
 let COMMON_POWEROFF = 0x01
 
 // CHG_CTRL.
-let CHG_GAUGE   = 0x08
-let CHG_BUTTON  = 0x04
-let CHG_CELL    = 0x02
-let CHG_WDT     = 0x01
+let CHG_GAUGE  = 0x08
+let CHG_BUTTON = 0x04
+let CHG_CELL   = 0x02
+let CHG_WDT    = 0x01
 
 // WDT_CTRL.
 let WDT_CLEAR = 0x08
@@ -126,20 +126,33 @@ let I2C_HZ = 400000
 // The rails of `PowerManager`, numbered in the order of the data sheet's
 // registers: the five DC-DC converters, then the LDOs.  The RTC LDOs have no
 // register and are not rails.
-pub const AXP_DCDC1   = 0
-pub const AXP_DCDC2   = 1
-pub const AXP_DCDC3   = 2
-pub const AXP_DCDC4   = 3
-pub const AXP_DCDC5   = 4
-pub const AXP_ALDO1   = 5
-pub const AXP_ALDO2   = 6
-pub const AXP_ALDO3   = 7
-pub const AXP_ALDO4   = 8
-pub const AXP_BLDO1   = 9
-pub const AXP_BLDO2   = 10
+pub const AXP_DCDC1 = 0
+// The DC-DC converter 2.
+pub const AXP_DCDC2 = 1
+// The DC-DC converter 3.
+pub const AXP_DCDC3 = 2
+// The DC-DC converter 4.
+pub const AXP_DCDC4 = 3
+// The DC-DC converter 5.
+pub const AXP_DCDC5 = 4
+// The ALDO1 low-dropout regulator.
+pub const AXP_ALDO1 = 5
+// The ALDO2 low-dropout regulator.
+pub const AXP_ALDO2 = 6
+// The ALDO3 low-dropout regulator.
+pub const AXP_ALDO3 = 7
+// The ALDO4 low-dropout regulator.
+pub const AXP_ALDO4 = 8
+// The BLDO1 low-dropout regulator.
+pub const AXP_BLDO1 = 9
+// The BLDO2 low-dropout regulator.
+pub const AXP_BLDO2 = 10
+// The CPUSLDO low-dropout regulator.
 pub const AXP_CPUSLDO = 11
-pub const AXP_DLDO1   = 12
-pub const AXP_DLDO2   = 13
+// The DLDO1 low-dropout regulator.
+pub const AXP_DLDO1 = 12
+// The DLDO2 low-dropout regulator.
+pub const AXP_DLDO2 = 13
 
 // The number of rails.
 pub const AXP_RAILS = 14
@@ -370,7 +383,7 @@ pub fn status_read<L: AxpLink>(l: L) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_STATUS1, 2, var b)
         return -1
-    (b[0] as Int) | ((b[1] as Int) << 8)
+    b[0] as Int | (b[1] as Int << 8)
 
 // Whether VBUS, the charger input, is good (STATUS1 bit 5).
 pub fn status_vbus_good(s: Int) -> Bool
@@ -443,7 +456,7 @@ pub fn adc_read<L: AxpLink>(l: L, reg: Int) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(reg, 2, var b)
         return -1
-    (((b[0] as Int) & 0x3F) << 8) | (b[1] as Int)
+    ((b[0] as Int & 0x3F) << 8) | b[1] as Int
 
 // The battery voltage in millivolts, 1 mV a step, or `None`.  The channel is
 // on after `start` (it is on at power-up).
@@ -878,29 +891,52 @@ pub fn watchdog_stop<L: AxpLink>(l: L) -> Bool [hw]
 // named for their status bits, warning in bit 7 and shutdown in bit 6; the
 // data sheet names the enable bits level 2 and level 1.
 
+// The battery is below the temperature limit for discharging.
 pub const AXP_IRQ_BAT_UNDER_TEMP_WORK = 0x000001
-pub const AXP_IRQ_BAT_OVER_TEMP_WORK  = 0x000002
-pub const AXP_IRQ_BAT_UNDER_TEMP_CHG  = 0x000004
-pub const AXP_IRQ_BAT_OVER_TEMP_CHG   = 0x000008
-pub const AXP_IRQ_GAUGE_NEW_SOC       = 0x000010
-pub const AXP_IRQ_GAUGE_WATCHDOG      = 0x000020
-pub const AXP_IRQ_SOC_SHUTDOWN        = 0x000040
-pub const AXP_IRQ_SOC_WARNING         = 0x000080
-pub const AXP_IRQ_KEY_RISING          = 0x000100
-pub const AXP_IRQ_KEY_FALLING         = 0x000200
-pub const AXP_IRQ_KEY_LONG            = 0x000400
-pub const AXP_IRQ_KEY_SHORT           = 0x000800
-pub const AXP_IRQ_BAT_REMOVE          = 0x001000
-pub const AXP_IRQ_BAT_INSERT          = 0x002000
-pub const AXP_IRQ_VBUS_REMOVE         = 0x004000
-pub const AXP_IRQ_VBUS_INSERT         = 0x008000
-pub const AXP_IRQ_BAT_OVER_VOLTAGE    = 0x010000
-pub const AXP_IRQ_CHARGE_TIMER        = 0x020000
-pub const AXP_IRQ_DIE_OVER_TEMP       = 0x040000
-pub const AXP_IRQ_CHARGE_START        = 0x080000
-pub const AXP_IRQ_CHARGE_DONE         = 0x100000
-pub const AXP_IRQ_LDO_OVER_CURRENT    = 0x400000
-pub const AXP_IRQ_WATCHDOG_EXPIRE     = 0x800000
+// The battery is above the temperature limit for discharging.
+pub const AXP_IRQ_BAT_OVER_TEMP_WORK = 0x000002
+// The battery is below the temperature limit for charging.
+pub const AXP_IRQ_BAT_UNDER_TEMP_CHG = 0x000004
+// The battery is above the temperature limit for charging.
+pub const AXP_IRQ_BAT_OVER_TEMP_CHG = 0x000008
+// The gauge has a new state-of-charge value.
+pub const AXP_IRQ_GAUGE_NEW_SOC = 0x000010
+// The gauge watchdog has expired.
+pub const AXP_IRQ_GAUGE_WATCHDOG = 0x000020
+// The state of charge is below the shutdown level.
+pub const AXP_IRQ_SOC_SHUTDOWN = 0x000040
+// The state of charge is below the warning level.
+pub const AXP_IRQ_SOC_WARNING = 0x000080
+// The power key was released: a rising edge.
+pub const AXP_IRQ_KEY_RISING = 0x000100
+// The power key was pressed: a falling edge.
+pub const AXP_IRQ_KEY_FALLING = 0x000200
+// The power key was held for the long-press time.
+pub const AXP_IRQ_KEY_LONG = 0x000400
+// The power key was held for the short-press time.
+pub const AXP_IRQ_KEY_SHORT = 0x000800
+// A battery was removed.
+pub const AXP_IRQ_BAT_REMOVE = 0x001000
+// A battery was inserted.
+pub const AXP_IRQ_BAT_INSERT = 0x002000
+// A supply on VBUS was removed.
+pub const AXP_IRQ_VBUS_REMOVE = 0x004000
+// A supply on VBUS was inserted.
+pub const AXP_IRQ_VBUS_INSERT = 0x008000
+// The battery voltage is above its limit.
+pub const AXP_IRQ_BAT_OVER_VOLTAGE = 0x010000
+// A charge timer has expired.
+pub const AXP_IRQ_CHARGE_TIMER = 0x020000
+// The die temperature is above its limit.
+pub const AXP_IRQ_DIE_OVER_TEMP = 0x040000
+// Charging has started.
+pub const AXP_IRQ_CHARGE_START = 0x080000
+// Charging has finished.
+pub const AXP_IRQ_CHARGE_DONE = 0x100000
+// An LDO is over its current limit.
+pub const AXP_IRQ_LDO_OVER_CURRENT = 0x400000
+// The watchdog has expired.
+pub const AXP_IRQ_WATCHDOG_EXPIRE = 0x800000
 
 // The interrupt sources the part has: the bits above, with the reserved bit
 // 21 left out.
@@ -911,7 +947,7 @@ pub fn irq_enabled<L: AxpLink>(l: L) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_IRQ_EN, 3, var b)
         return -1
-    (b[0] as Int) | ((b[1] as Int) << 8) | ((b[2] as Int) << 16)
+    b[0] as Int | (b[1] as Int << 8) | (b[2] as Int << 16)
 
 // Sets the sources that raise the IRQ pin to exactly `mask`, in one write of
 // the three registers.  Whether the part took it.
@@ -939,7 +975,7 @@ pub fn irq_status<L: AxpLink>(l: L) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_IRQ_ST, 3, var b)
         return -1
-    (b[0] as Int) | ((b[1] as Int) << 8) | ((b[2] as Int) << 16)
+    b[0] as Int | (b[1] as Int << 8) | (b[2] as Int << 16)
 
 // Clears the flags of `mask`: the three registers are written with the bits
 // of the mask, in one transaction, and the part clears the bits written as
@@ -1067,7 +1103,8 @@ struct Axp2101Link
 // over a double of the part.
 
 // Reads `n` registers from `reg` in one transaction.
-pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                           var dst: DevBytes) -> Bool [hw]
     dev_bus.wiring_read_into(bus, w, reg, n, var dst)
 
 // Writes the bytes of `src` from `reg` in one transaction.

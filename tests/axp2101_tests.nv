@@ -80,7 +80,11 @@ fn power_up(c: Chip)
         c.regs.insert(r, 0x05)
 
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), log: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        mute: HashMap.new(),
+        deaf: HashMap.new(),
+        log: HashMap.new() }
     c.st.insert(1, 1)
     c.st.insert(9, 0x34)
     c.st.insert(19, 1)
@@ -470,6 +474,8 @@ fn test_the_adc_is_14_bits_high_six_first() [io]
     c.regs.insert(0x35, 0x68)
     test.assert_eq(axp2101.vbat_mv(link(c)) ?? -1, 4200)
     test.assert(log_is(c, [1, 0x34, 2]))
+    // The reader the channels share answers the 14 bits at a register.
+    test.assert_eq(axp2101.adc_read(link(c), 0x34), 4200)
     c.regs.insert(0x38, 0x13)
     c.regs.insert(0x39, 0x88)
     test.assert_eq(axp2101.vbus_mv(link(c)) ?? -1, 5000)
@@ -488,6 +494,7 @@ fn test_the_adc_is_14_bits_high_six_first() [io]
     // A part that does not answer.
     c.st.insert(1, 0)
     test.assert(axp2101.vbat_mv(link(c)) == None)
+    test.assert_eq(axp2101.adc_read(link(c), 0x34), -1)
     test.assert(axp2101.vbus_mv(link(c)) == None)
     test.assert(axp2101.vsys_mv(link(c)) == None)
     test.assert(axp2101.ts_uv(link(c)) == None)
@@ -524,7 +531,10 @@ fn test_the_battery_is_read_in_three_transactions() [io]
     let c = chip()
     with_battery(c, 3874, 87)
     c.regs.insert(0x01, 0x22)
-    let b = axp2101.battery_read(link(c)) ?? dev_power.BatteryReading { voltage: MilliVolts { mv: -1 }, current: dev_power.MilliAmps { ma: -1 }, charge: ChargeState.ChargeFault, percent: None }
+    let b = axp2101.battery_read(link(c)) ?? dev_power.BatteryReading { voltage: MilliVolts { mv: -1 },
+        current: dev_power.MilliAmps { ma: -1 },
+        charge: ChargeState.ChargeFault,
+        percent: None }
     test.assert_eq(b.voltage.mv, 3874)
     test.assert_eq(b.current.ma, 0)
     test.assert(b.charge == ChargeState.ChargeConstantCurrent)
@@ -836,6 +846,11 @@ fn test_the_charge_voltage_is_one_of_five_and_never_5_volts() [io]
         c.regs.insert(0x64, case[0])
         test.assert_eq(axp2101.charge_voltage_read(l) ?? -1, case[1])
         test.assert_eq(axp2101.cv_code_of_mv(case[1]), case[0])
+        test.assert_eq(axp2101.cv_mv_of_code(case[0]), case[1])
+    // Code 0 and the reserved codes are no voltage.
+    test.assert_eq(axp2101.cv_mv_of_code(0), -1)
+    test.assert_eq(axp2101.cv_mv_of_code(6), -1)
+    test.assert_eq(axp2101.cv_mv_of_code(7), -1)
     // Code 0 and the reserved codes read as nothing.
     c.regs.insert(0x64, 0)
     test.assert(axp2101.charge_voltage_read(l) == None)
@@ -960,7 +975,29 @@ fn test_the_interrupt_sources_have_their_bits() [io]
     test.assert_eq(axp2101.AXP_IRQ_WATCHDOG_EXPIRE, 0x800000)
     // Every source once, and the reserved bit 21 not at all.
     var all = 0
-    for b in [0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000, 0x40000, 0x80000, 0x100000, 0x400000, 0x800000]
+    for b in [0x1,
+    0x2,
+    0x4,
+    0x8,
+    0x10,
+    0x20,
+    0x40,
+    0x80,
+    0x100,
+    0x200,
+    0x400,
+    0x800,
+    0x1000,
+    0x2000,
+    0x4000,
+    0x8000,
+    0x10000,
+    0x20000,
+    0x40000,
+    0x80000,
+    0x100000,
+    0x400000,
+    0x800000]
         all = all | b
     test.assert_eq(all, axp2101.AXP_IRQ_ALL)
     test.assert_eq(all & 0x200000, 0)
