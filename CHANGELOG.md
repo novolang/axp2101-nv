@@ -28,8 +28,9 @@ I2C bus.
   action, and the power-off and restart commands.
 - The suite runs over a double of the part and covers every line of `src/`.
 - The device program `examples/power_monitor.nv`, a power monitor. Built for
-  the nRF52840-DK it is 13,328 B of flash, for the nRF54LM20-DK 14,156 B and
-  for the FRDM-MCXN947 23,324 B.
+  the nRF52840-DK it is 21,160 B of flash, for the nRF54LM20-DK 22,120 B and
+  for the FRDM-MCXN947 23,376 B; before the Nordic buses landed, with the
+  register paths left out, the two DK images were 13,328 B and 14,156 B.
 
 ### Known
 
@@ -37,8 +38,9 @@ I2C bus.
 - The M5Stack CoreS3, the board of the candidates page, has an ESP32-S3, and
   the BSPs of the novo-lang repository have no ESP32-S3 target. The device
   program builds for the nRF52840 DK, the nRF54LM20 DK and the FRDM-MCXN947
-  instead. The Nordic board packages answer for I2C as absent hardware, so on
-  those images `begin` answers -1 until the boards drive the bus.
+  instead. The nRF52840 DK drives I2C with TWIM0 and the nRF54LM20 DK
+  with TWIM22, so their images carry the register paths; a reply from the part
+  over either bus is NOT VERIFIED.
 - The data sheet read is version 1.4 (October 2022) from a third-party mirror.
   It does not list the identification register (0x03, value 0x4A, from Zephyr
   and XPowersLib), gives no conversion for the die temperature (XPowersLib's

@@ -69,18 +69,23 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which the program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 13,328 B | 1,568 B | 2,660 B |
-| `nrf54lm20-dk` | 14,156 B | 1,602 B | 2,644 B |
-| `frdm-mcxn947` | 23,324 B | 7,514 B | 2,748 B |
+| `nrf52840-dk` | 21,160 B | 5,636 B | 3,252 B |
+| `nrf54lm20-dk` | 22,120 B | 5,788 B | 3,236 B |
+| `frdm-mcxn947` | 23,376 B | 7,560 B | 2,748 B |
 
 The numbers are from the build's memory report. Flash also holds the runtime,
 the compiler's support library and the program's tables. The arena, 65,536 B
 on the Nordic boards, is the runtime's heap and is reserved whether or not the
-program uses it. The two Nordic board packages answer for I2C as absent
-hardware, so the build removes the code that follows the first bus read, and
-their rows are the image without the driver's register paths; the
-FRDM-MCXN947 board package drives I2C, and its row is the image with the
-driver's code in it. The driver's own code allocates nothing: every buffer is
+program uses it. The Nordic DKs drive I2C with a TWIM (the nRF52840 DK's TWIM0 on SDA P0.26 and
+SCL P0.27, the nRF54LM20 DK's TWIM22 on SDA P1.03 and SCL P1.04), on the pins
+`docs/hal/README.md` names under "The Nordic DKs' buses", so all three rows
+are the image with the driver's register paths in it. Before the Nordic buses
+landed the two DK rows were 13,328 and 14,156 bytes of flash, of which the
+program was 1,568 and 1,602 bytes: the board packages answered for I2C as
+absent hardware, and the build removed the code that follows the first bus
+read. A reply from the part over a DK's bus is NOT VERIFIED until the driver
+rig carries one.
+The driver's own code allocates nothing: every buffer is
 a fixed-size `Vec` in the caller's frame.
 
 ### The effects
