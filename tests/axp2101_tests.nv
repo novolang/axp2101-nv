@@ -1,0 +1,1176 @@
+// axp2101_tests — the driver over a double of the part: a register file that
+// answers on an I2C bus the way X-Powers' data sheet (AXP2101 version 1.4,
+// section 6.13) says an AXP2101 does, so every transaction of every entry
+// point is checked on the host.
+//
+// The double follows the data sheet where the driver depends on it:
+//
+//   - registers are read and written in sequence, the address advancing;
+//   - the interrupt status registers 0x48 to 0x4A clear the bits written as 1
+//     and keep the bits written as 0;
+//   - COMMON (0x10) bits 0 and 1, the gauge reset (0x17 bit 3) and the
+//     watchdog clear (0x19 bit 3) clear themselves, and the double counts
+//     the times each was written;
+//   - the ADC data registers are read-only, except the debug select in the
+//     top two bits of 0x34 and 0x36.
+//
+// The log records what the driver did, as integers:
+//   1 reg n          a read of n registers from reg
+//   2 reg n bytes    a write of n bytes from reg
+//   5 pin dir        a pin's mode
+//   6 hz             the bus initialised at hz
+//
+// The double can refuse the n-th write (`st` 2) or the n-th read (`st` 7), a
+// register's writes (`mute`) or reads (`deaf`), or be absent (`st` 1).
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts, ChargeState, RailState, PowerSource, PowerManager }
+use dev_id.{ Identifiable, DeviceId }
+use axp2101
+use axp2101.{ Axp2101, AxpLink }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `st` keys: 1 is 1 when a part is there; 2 the write to refuse, counting
+// from 1; 3 the writes seen; 7 the read to refuse; 8 the reads seen; 9 the
+// 7-bit address of the part; 10 the power-offs written; 11 the restarts; 12
+// the gauge resets; 13 the watchdog feeds; 19 the level of the IRQ pin.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.log, -1)
+    c.log.insert(n, v)
+    c.log.insert(-1, n + 1)
+
+fn log_clear(c: Chip)
+    c.log.clear()
+
+// The register file at power-up (§ 6.13) with a part as an M5Stack CoreS3
+// carries it: the identification, the ADC channels of the battery and TS on,
+// the gauge and the cell charger on, the charger at 4.2 V and 500 mA, the
+// converters and LDOs on with voltages whose other bits are set (DCDC2 and
+// DCDC3 with the dynamic-voltage enable, DCDC5 with its compensation bit).
+fn power_up(c: Chip)
+    c.regs.clear()
+    c.regs.insert(0x03, 0x4A)
+    c.regs.insert(0x18, 0x0A)
+    c.regs.insert(0x30, 0x03)
+    c.regs.insert(0x62, 0x0B)
+    c.regs.insert(0x64, 0x03)
+    c.regs.insert(0x80, 0x1F)
+    c.regs.insert(0x82, 0x11)
+    c.regs.insert(0x83, 0x80 | 0x12)
+    c.regs.insert(0x84, 0x80 | 0x30)
+    c.regs.insert(0x85, 0x00)
+    c.regs.insert(0x86, 0x20 | 0x0A)
+    c.regs.insert(0x90, 0x0F)
+    c.regs.insert(0x91, 0x01)
+    for r in 0x92..0x9B
+        c.regs.insert(r, 0x05)
+
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), log: HashMap.new() }
+    c.st.insert(1, 1)
+    c.st.insert(9, 0x34)
+    c.st.insert(19, 1)
+    power_up(c)
+    c
+
+// A register written with the part's rules.
+fn store(c: Chip, reg: Int, v: Int)
+    if reg >= 0x48 and reg <= 0x4A
+        c.regs.insert(reg, at(c.regs, reg) & (0xFF ^ v))
+        return
+    if reg == 0x10
+        if (v & 1) != 0
+            c.st.insert(10, at(c.st, 10) + 1)
+        if (v & 2) != 0
+            c.st.insert(11, at(c.st, 11) + 1)
+        c.regs.insert(reg, v & 0xFC)
+        return
+    if reg == 0x17
+        if (v & 8) != 0
+            c.st.insert(12, at(c.st, 12) + 1)
+        c.regs.insert(reg, v & 0xF7)
+        return
+    if reg == 0x19
+        if (v & 8) != 0
+            c.st.insert(13, at(c.st, 13) + 1)
+        c.regs.insert(reg, v & 0xF7)
+        return
+    if reg >= 0x34 and reg <= 0x3D
+        if reg == 0x34 or reg == 0x36
+            c.regs.insert(reg, (at(c.regs, reg) & 0x3F) | (v & 0xC0))
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        log_push(self.c, 6)
+        log_push(self.c, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 2)
+        log_push(self.c, data[0] as Int)
+        log_push(self.c, data.len() - 1)
+        for i in 1..data.len()
+            log_push(self.c, data[i] as Int)
+        if at(self.c.st, 1) == 0 or addr != at(self.c.st, 9) or data.len() < 2
+            return false
+        self.c.st.insert(3, at(self.c.st, 3) + 1)
+        if at(self.c.st, 2) == at(self.c.st, 3)
+            return false
+        var r = data[0] as Int
+        if at(self.c.mute, r) != 0
+            return false
+        for i in 1..data.len()
+            store(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 1)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        if at(self.c.st, 1) == 0 or addr != at(self.c.st, 9)
+            return None
+        self.c.st.insert(8, at(self.c.st, 8) + 1)
+        if at(self.c.st, 7) == at(self.c.st, 8)
+            return None
+        var r = tx[0] as Int
+        if at(self.c.deaf, r) != 0
+            return None
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, at(self.c.regs, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakePins
+    c: Chip
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        log_push(self.c, 5)
+        log_push(self.c, pin)
+        log_push(self.c, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        pass
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.c.st, 19)
+
+// The link over the double: the driver's own framing over the double's bus
+// and pin.
+struct TestLink
+    c: Chip
+    w: DeviceWiring
+
+impl AxpLink for TestLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        axp2101.i2c_read(FakeI2c { c: self.c }, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        axp2101.i2c_write(FakeI2c { c: self.c }, self.w, reg, src)
+
+    fn link_irq(self) -> Int [hw]
+        axp2101.irq_level_of(FakePins { c: self.c }, self.w)
+
+    fn link_setup(self) [hw]
+        axp2101.link_ready(FakeI2c { c: self.c }, FakePins { c: self.c }, self.w)
+
+// A part at 0x34 whose IRQ output is on pin 25.
+fn link(c: Chip) -> TestLink
+    TestLink { c: c, w: dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x34), 25) }
+
+// The same with no IRQ pin.
+fn link_noirq(c: Chip) -> TestLink
+    TestLink { c: c, w: dev_bus.wiring_i2c(0, 0x34) }
+
+// A wiring with no address, which the driver cannot use.
+fn link_noaddr(c: Chip) -> TestLink
+    TestLink { c: c, w: dev_bus.wiring_spi(0, 4) }
+
+// Whether the log holds exactly the integers of `xs`.
+fn log_is(c: Chip, xs: [Int]) -> Bool
+    if at(c.log, -1) != xs.len()
+        return false
+    for i in 0..xs.len()
+        if at(c.log, i) != xs[i]
+            return false
+    true
+
+fn reg(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// A battery is present, the cell is at `mv` millivolts, and the gauge says
+// `pct` percent.
+fn with_battery(c: Chip, mv: Int, pct: Int)
+    c.regs.insert(0x00, 0x08)
+    c.regs.insert(0x34, (mv >> 8) & 0x3F)
+    c.regs.insert(0x35, mv & 0xFF)
+    c.regs.insert(0xA4, pct)
+
+// ── The voltage tables ───────────────────────────────────────────────
+
+@test
+fn test_the_register_codes_of_the_data_sheet_give_its_voltages() [io]
+    // § 6.13.2.70 to 6.13.2.85, the endpoints each table names.
+    test.assert_eq(axp2101.voltage_of_code(0, 0), 1500)
+    test.assert_eq(axp2101.voltage_of_code(0, 19), 3400)
+    test.assert_eq(axp2101.voltage_of_code(1, 0), 500)
+    test.assert_eq(axp2101.voltage_of_code(1, 0x46), 1200)
+    test.assert_eq(axp2101.voltage_of_code(1, 0x47), 1220)
+    test.assert_eq(axp2101.voltage_of_code(1, 0x48), 1240)
+    test.assert_eq(axp2101.voltage_of_code(1, 0x57), 1540)
+    test.assert_eq(axp2101.voltage_of_code(2, 0x57), 1540)
+    test.assert_eq(axp2101.voltage_of_code(3, 0x66), 1840)
+    test.assert_eq(axp2101.voltage_of_code(3, 0x47), 1220)
+    test.assert_eq(axp2101.voltage_of_code(4, 0), 1400)
+    test.assert_eq(axp2101.voltage_of_code(4, 23), 3700)
+    test.assert_eq(axp2101.voltage_of_code(4, 0x19), 1200)
+    for rail in 5..11
+        test.assert_eq(axp2101.voltage_of_code(rail, 0), 500)
+        test.assert_eq(axp2101.voltage_of_code(rail, 30), 3500)
+    test.assert_eq(axp2101.voltage_of_code(11, 0), 500)
+    test.assert_eq(axp2101.voltage_of_code(11, 1), 550)
+    test.assert_eq(axp2101.voltage_of_code(11, 18), 1400)
+    test.assert_eq(axp2101.voltage_of_code(13, 18), 1400)
+    test.assert_eq(axp2101.voltage_of_code(12, 0x1C), 3300)
+
+@test
+fn test_reserved_codes_and_unknown_rails_have_no_voltage() [io]
+    test.assert_eq(axp2101.voltage_of_code(0, 20), -1)
+    test.assert_eq(axp2101.voltage_of_code(0, -1), -1)
+    test.assert_eq(axp2101.voltage_of_code(1, 0x58), -1)
+    test.assert_eq(axp2101.voltage_of_code(3, 0x67), -1)
+    test.assert_eq(axp2101.voltage_of_code(4, 24), -1)
+    test.assert_eq(axp2101.voltage_of_code(4, 26), -1)
+    test.assert_eq(axp2101.voltage_of_code(4, -1), -1)
+    test.assert_eq(axp2101.voltage_of_code(5, 31), -1)
+    // The data sheet's table for CPUSLDO and DLDO2 ends at code 19, "1.40V",
+    // while its range ends at code 18: the driver takes the range.
+    test.assert_eq(axp2101.voltage_of_code(11, 19), -1)
+    test.assert_eq(axp2101.voltage_of_code(13, 19), -1)
+    test.assert_eq(axp2101.voltage_of_code(12, 29), -1)
+    test.assert_eq(axp2101.voltage_of_code(14, 0), -1)
+    test.assert_eq(axp2101.voltage_of_code(-1, 0), -1)
+    test.assert_eq(axp2101.voltage_code(14, 1800), -1)
+    test.assert_eq(axp2101.voltage_code(-1, 1800), -1)
+
+@test
+fn test_a_request_goes_to_the_step_at_or_below_it() [io]
+    // DCDC1: 100 mV steps from 1500 to 3400.
+    test.assert_eq(axp2101.voltage_code(0, 1499), -1)
+    test.assert_eq(axp2101.voltage_code(0, 1500), 0)
+    test.assert_eq(axp2101.voltage_code(0, 1599), 0)
+    test.assert_eq(axp2101.voltage_code(0, 1600), 1)
+    test.assert_eq(axp2101.voltage_code(0, 3400), 19)
+    test.assert_eq(axp2101.voltage_code(0, 5000), 19)
+    // DCDC2 and DCDC3: 10 mV steps to 1200, then 20 mV steps from 1220.
+    test.assert_eq(axp2101.voltage_code(1, 499), -1)
+    test.assert_eq(axp2101.voltage_code(1, 500), 0)
+    test.assert_eq(axp2101.voltage_code(1, 509), 0)
+    test.assert_eq(axp2101.voltage_code(1, 1200), 70)
+    test.assert_eq(axp2101.voltage_code(1, 1219), 70)
+    test.assert_eq(axp2101.voltage_code(1, 1220), 71)
+    test.assert_eq(axp2101.voltage_code(1, 1239), 71)
+    test.assert_eq(axp2101.voltage_code(1, 1240), 72)
+    test.assert_eq(axp2101.voltage_code(1, 1540), 87)
+    test.assert_eq(axp2101.voltage_code(1, 1800), 87)
+    test.assert_eq(axp2101.voltage_code(2, 1230), 71)
+    // DCDC4 goes on to 1840.
+    test.assert_eq(axp2101.voltage_code(3, 1840), 102)
+    test.assert_eq(axp2101.voltage_code(3, 2500), 102)
+    test.assert_eq(axp2101.voltage_code(3, 1500), 71 + 14)
+    test.assert_eq(axp2101.voltage_code(3, 499), -1)
+    // DCDC5: 1200 as its own code, then 1400 to 3700.
+    test.assert_eq(axp2101.voltage_code(4, 1199), -1)
+    test.assert_eq(axp2101.voltage_code(4, 1200), 25)
+    test.assert_eq(axp2101.voltage_code(4, 1399), 25)
+    test.assert_eq(axp2101.voltage_code(4, 1400), 0)
+    test.assert_eq(axp2101.voltage_code(4, 3300), 19)
+    test.assert_eq(axp2101.voltage_code(4, 3700), 23)
+    test.assert_eq(axp2101.voltage_code(4, 4000), 23)
+    // The LDOs: 100 mV steps from 500 to 3500, 50 mV steps to 1400, and 3300
+    // for DLDO1.
+    test.assert_eq(axp2101.voltage_code(5, 499), -1)
+    test.assert_eq(axp2101.voltage_code(5, 3300), 28)
+    test.assert_eq(axp2101.voltage_code(8, 3500), 30)
+    test.assert_eq(axp2101.voltage_code(8, 4000), 30)
+    test.assert_eq(axp2101.voltage_code(11, 549), 0)
+    test.assert_eq(axp2101.voltage_code(11, 550), 1)
+    test.assert_eq(axp2101.voltage_code(11, 1400), 18)
+    test.assert_eq(axp2101.voltage_code(13, 1450), 18)
+    test.assert_eq(axp2101.voltage_code(12, 3400), 28)
+    test.assert_eq(axp2101.voltage_code(12, 3300), 28)
+
+@test
+fn test_every_code_of_every_rail_round_trips() [io]
+    // The code of the voltage of a code is the code, for every valid code.
+    for rail in 0..14
+        var valid = 0
+        for code in 0..128
+            let mv = axp2101.voltage_of_code(rail, code)
+            if mv >= 0
+                valid = valid + 1
+                test.assert_eq(axp2101.voltage_code(rail, mv), code)
+        // The number of codes each rail has: 20, 88, 88, 103, 25, 31 for the
+        // six 0.5 to 3.5 V LDOs, 19 for CPUSLDO, 29 for DLDO1, 19 for DLDO2.
+        if rail == 0
+            test.assert_eq(valid, 20)
+        if rail == 1 or rail == 2
+            test.assert_eq(valid, 88)
+        if rail == 3
+            test.assert_eq(valid, 103)
+        if rail == 4
+            test.assert_eq(valid, 25)
+        if rail >= 5 and rail <= 10
+            test.assert_eq(valid, 31)
+        if rail == 11 or rail == 13
+            test.assert_eq(valid, 19)
+        if rail == 12
+            test.assert_eq(valid, 29)
+
+// ── Register access, identity, start ─────────────────────────────────
+
+@test
+fn test_a_register_is_read_written_and_updated() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(axp2101.reg_read(l, 0x03) ?? -1, 0x4A)
+    test.assert(axp2101.reg_write(l, 0x1A, 0x5A))
+    test.assert_eq(reg(c, 0x1A), 0x5A)
+    test.assert(axp2101.reg_update(l, 0x1A, 0x0F, 0x03))
+    test.assert_eq(reg(c, 0x1A), 0x53)
+    test.assert(log_is(c, [1, 0x03, 1, 2, 0x1A, 1, 0x5A, 1, 0x1A, 1, 2, 0x1A, 1, 0x53]))
+    c.deaf.insert(0x1A, 1)
+    test.assert(not axp2101.reg_update(l, 0x1A, 0x0F, 0x03))
+    test.assert(axp2101.reg_read(l, 0x1A) == None)
+
+@test
+fn test_the_part_is_identified_by_its_register() [io]
+    let c = chip()
+    let id = axp2101.identify(link(c)) ?? DeviceId { who: -1, rev: Some(0) }
+    test.assert_eq(id.who, 0x4A)
+    test.assert(id.rev == None)
+    // Another value is another part; no answer is no part.
+    c.regs.insert(0x03, 0x4B)
+    test.assert(axp2101.identify(link(c)) == None)
+    c.st.insert(1, 0)
+    test.assert(axp2101.identify(link(c)) == None)
+    test.assert(axp2101.identify(link_noaddr(c)) == None)
+
+@test
+fn test_start_checks_the_part_and_switches_on_the_adc() [io]
+    let c = chip()
+    test.assert_eq(axp2101.start(link(c)), 0)
+    // The bus and the IRQ pin; the identification; the ADC channels of the
+    // battery, VBUS, VSYS and the die read and written back with TS as it
+    // was.
+    test.assert(log_is(c, [
+        6, 400000,
+        5, 25, 2,
+        1, 0x03, 1,
+        1, 0x30, 1,
+        2, 0x30, 1, 0x1F]))
+    test.assert_eq(reg(c, 0x30), 0x1F)
+    // No part, another part, a refused write.
+    let d = chip()
+    d.st.insert(1, 0)
+    test.assert_eq(axp2101.start(link(d)), -1)
+    let e = chip()
+    e.regs.insert(0x03, 0x00)
+    test.assert_eq(axp2101.start(link(e)), -1)
+    let f = chip()
+    f.st.insert(2, 1)
+    test.assert_eq(axp2101.start(link(f)), -2)
+
+// ── Status ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_status_registers_are_read_together() [io]
+    let c = chip()
+    c.regs.insert(0x00, 0x38)
+    c.regs.insert(0x01, 0x22)
+    test.assert_eq(axp2101.status_read(link(c)), 0x2238)
+    test.assert(log_is(c, [1, 0x00, 2]))
+    let s = axp2101.status_read(link(c))
+    test.assert(axp2101.status_vbus_good(s))
+    test.assert(axp2101.status_battery_present(s))
+    test.assert(axp2101.status_batfet_open(s))
+    test.assert_eq(axp2101.status_current_direction(s), 1)
+    let q = 0x0000
+    test.assert(not axp2101.status_vbus_good(q))
+    test.assert(not axp2101.status_battery_present(q))
+    test.assert(not axp2101.status_batfet_open(q))
+    test.assert_eq(axp2101.status_current_direction(q), 0)
+    test.assert_eq(axp2101.status_current_direction(0x4000), 2)
+    test.assert_eq(axp2101.status_read(link_noaddr(c)), -1)
+
+@test
+fn test_the_charging_status_is_a_phase() [io]
+    test.assert(axp2101.status_charge(0x0000) == ChargeState.ChargePrecharge)
+    test.assert(axp2101.status_charge(0x0100) == ChargeState.ChargePrecharge)
+    test.assert(axp2101.status_charge(0x0200) == ChargeState.ChargeConstantCurrent)
+    test.assert(axp2101.status_charge(0x0300) == ChargeState.ChargeConstantVoltage)
+    test.assert(axp2101.status_charge(0x0400) == ChargeState.ChargeDone)
+    test.assert(axp2101.status_charge(0x0500) == ChargeState.ChargeIdle)
+    test.assert(axp2101.status_charge(0x0600) == ChargeState.ChargeFault)
+    test.assert(axp2101.status_charge(0x0700) == ChargeState.ChargeFault)
+    // The bits above the field do not change it.
+    test.assert(axp2101.status_charge(0x7A02) == ChargeState.ChargeConstantCurrent)
+    let c = chip()
+    c.regs.insert(0x01, 0x04)
+    test.assert(axp2101.charge_state(link(c)) == ChargeState.ChargeDone)
+    c.st.insert(1, 0)
+    test.assert(axp2101.charge_state(link(c)) == ChargeState.ChargeFault)
+
+@test
+fn test_the_power_source_is_usb_battery_or_none() [io]
+    let c = chip()
+    c.regs.insert(0x00, 0x20)
+    test.assert(axp2101.source_read(link(c)) == PowerSource.PowerUsb)
+    c.regs.insert(0x00, 0x28)
+    test.assert(axp2101.source_read(link(c)) == PowerSource.PowerUsb)
+    c.regs.insert(0x00, 0x08)
+    test.assert(axp2101.source_read(link(c)) == PowerSource.PowerBattery)
+    c.regs.insert(0x00, 0x00)
+    test.assert(axp2101.source_read(link(c)) == PowerSource.PowerNone)
+    c.st.insert(1, 0)
+    test.assert(axp2101.source_read(link(c)) == PowerSource.PowerUnknown)
+
+// ── ADC ──────────────────────────────────────────────────────────────
+
+@test
+fn test_the_adc_is_14_bits_high_six_first() [io]
+    let c = chip()
+    // 4200 mV: 0x1068, the high six bits 0x10 and the low byte 0x68.  The
+    // debug select in the top two bits of the first register is not data.
+    c.regs.insert(0x34, 0xC0 | 0x10)
+    c.regs.insert(0x35, 0x68)
+    test.assert_eq(axp2101.vbat_mv(link(c)) ?? -1, 4200)
+    test.assert(log_is(c, [1, 0x34, 2]))
+    c.regs.insert(0x38, 0x13)
+    c.regs.insert(0x39, 0x88)
+    test.assert_eq(axp2101.vbus_mv(link(c)) ?? -1, 5000)
+    c.regs.insert(0x3A, 0x0F)
+    c.regs.insert(0x3B, 0xA0)
+    test.assert_eq(axp2101.vsys_mv(link(c)) ?? -1, 4000)
+    // TS counts 0.5 mV: 0x03E8 is 1000, 500 mV, the 10 kohm thermistor at 25
+    // degrees of the data sheet's Table 6-3.
+    c.regs.insert(0x36, 0x03)
+    c.regs.insert(0x37, 0xE8)
+    test.assert_eq(axp2101.ts_uv(link(c)) ?? -1, 500000)
+    // The largest 14-bit value.
+    c.regs.insert(0x34, 0x3F)
+    c.regs.insert(0x35, 0xFF)
+    test.assert_eq(axp2101.vbat_mv(link(c)) ?? -1, 16383)
+    // A part that does not answer.
+    c.st.insert(1, 0)
+    test.assert(axp2101.vbat_mv(link(c)) == None)
+    test.assert(axp2101.vbus_mv(link(c)) == None)
+    test.assert(axp2101.vsys_mv(link(c)) == None)
+    test.assert(axp2101.ts_uv(link(c)) == None)
+    test.assert(axp2101.die_temp_read(link(c)) == None)
+
+@test
+fn test_the_die_temperature_is_the_librarys_formula() [io]
+    test.assert_eq(axp2101.die_temp_milli_c(7274), 22000)
+    test.assert_eq(axp2101.die_temp_milli_c(7174), 27000)
+    test.assert_eq(axp2101.die_temp_milli_c(7374), 17000)
+    let c = chip()
+    c.regs.insert(0x3C, 0x1C)
+    c.regs.insert(0x3D, 0x6A)
+    test.assert_eq(axp2101.die_temp_read(link(c)) ?? -1, 22000)
+
+@test
+fn test_adc_channels_are_switched_in_their_register() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert(axp2101.adc_channels(l, 0x1C, true))
+    test.assert_eq(reg(c, 0x30), 0x1F)
+    test.assert(axp2101.adc_channels(l, 0x04, false))
+    test.assert_eq(reg(c, 0x30), 0x1B)
+    // The two top bits are not channels.
+    test.assert(axp2101.adc_channels(l, 0xFF, true))
+    test.assert_eq(reg(c, 0x30), 0x3F)
+    test.assert(axp2101.adc_channels(l, 0xFF, false))
+    test.assert_eq(reg(c, 0x30), 0x00)
+
+// ── The battery and the gauge ────────────────────────────────────────
+
+@test
+fn test_the_battery_is_read_in_three_transactions() [io]
+    let c = chip()
+    with_battery(c, 3874, 87)
+    c.regs.insert(0x01, 0x22)
+    let b = axp2101.battery_read(link(c)) ?? dev_power.BatteryReading { voltage: MilliVolts { mv: -1 }, current: dev_power.MilliAmps { ma: -1 }, charge: ChargeState.ChargeFault, percent: None }
+    test.assert_eq(b.voltage.mv, 3874)
+    test.assert_eq(b.current.ma, 0)
+    test.assert(b.charge == ChargeState.ChargeConstantCurrent)
+    test.assert_eq(b.percent ?? -1, 87)
+    // STATUS1 and STATUS2; VBAT; the percentage.  A second status read for
+    // the percentage's presence check.
+    test.assert(log_is(c, [1, 0x00, 2, 1, 0x34, 2, 1, 0x00, 2, 1, 0xA4, 1]))
+
+@test
+fn test_no_battery_means_no_reading() [io]
+    let c = chip()
+    c.regs.insert(0x00, 0x20)
+    c.regs.insert(0xA4, 0)
+    test.assert(axp2101.battery_read(link(c)) == None)
+    // Only the status was read: the voltage and the percentage were not.
+    test.assert(log_is(c, [1, 0x00, 2]))
+    // The register reads 0, which would pass for an empty battery.
+    test.assert(axp2101.percent_read(link(c)) == None)
+    // No part.
+    c.st.insert(1, 0)
+    test.assert(axp2101.battery_read(link(c)) == None)
+    test.assert(axp2101.percent_read(link(c)) == None)
+
+@test
+fn test_the_percentage_is_held_to_100() [io]
+    let c = chip()
+    with_battery(c, 4100, 100)
+    test.assert_eq(axp2101.percent_read(link(c)) ?? -1, 100)
+    c.regs.insert(0xA4, 101)
+    test.assert_eq(axp2101.percent_read(link(c)) ?? -1, 100)
+    c.regs.insert(0xA4, 0xFF)
+    test.assert_eq(axp2101.percent_read(link(c)) ?? -1, 100)
+    c.regs.insert(0xA4, 0)
+    test.assert_eq(axp2101.percent_read(link(c)) ?? -1, 0)
+
+@test
+fn test_each_read_of_the_battery_can_fail() [io]
+    // STATUS, VBAT, STATUS, percentage.
+    for n in 1..5
+        let c = chip()
+        with_battery(c, 3900, 50)
+        c.st.insert(7, n)
+        test.assert(axp2101.battery_read(link(c)) == None)
+
+@test
+fn test_the_gauge_and_its_warning_levels() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert(axp2101.gauge_enable(l, false))
+    test.assert_eq(reg(c, 0x18), 0x02)
+    test.assert(axp2101.gauge_enable(l, true))
+    test.assert_eq(reg(c, 0x18), 0x0A)
+    test.assert(axp2101.gauge_reset(l))
+    test.assert_eq(at(c.st, 12), 1)
+    test.assert_eq(reg(c, 0x17), 0)
+    // Level 2 from 5 to 20 percent, level 1 from 0 to 15.
+    test.assert(axp2101.battery_warning_set(l, 5, 15))
+    test.assert_eq(reg(c, 0x1A), 0xA5)
+    test.assert(axp2101.battery_warning_set(l, 99, 99))
+    test.assert_eq(reg(c, 0x1A), 0xFF)
+    test.assert(axp2101.battery_warning_set(l, -3, 0))
+    test.assert_eq(reg(c, 0x1A), 0x00)
+
+// ── Rails ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_rails_have_their_enable_bits() [io]
+    // The converters are bits 0 to 4 of 0x80; ALDO1 to DLDO1 are bits 0 to 7
+    // of 0x90 and DLDO2 is bit 0 of 0x91.
+    let c = chip()
+    c.regs.insert(0x80, 0x00)
+    c.regs.insert(0x90, 0x00)
+    c.regs.insert(0x91, 0x00)
+    let l = link(c)
+    for rail in 0..14
+        test.assert_eq(axp2101.rail_is_on(l, rail) ?? true, false)
+    for rail in 0..14
+        test.assert(axp2101.rail_switch(l, rail, true))
+        test.assert_eq(axp2101.rail_is_on(l, rail) ?? false, true)
+    test.assert_eq(reg(c, 0x80), 0x1F)
+    test.assert_eq(reg(c, 0x90), 0xFF)
+    test.assert_eq(reg(c, 0x91), 0x01)
+    // Switching one off leaves the others.
+    test.assert(axp2101.rail_switch(l, 6, false))
+    test.assert_eq(reg(c, 0x90), 0xFD)
+    test.assert(axp2101.rail_switch(l, 1, false))
+    test.assert_eq(reg(c, 0x80), 0x1D)
+    test.assert(axp2101.rail_switch(l, 13, false))
+    test.assert_eq(reg(c, 0x91), 0x00)
+    // Outside 0 to 13.
+    test.assert(not axp2101.rail_switch(l, 14, true))
+    test.assert(not axp2101.rail_switch(l, -1, true))
+    test.assert(axp2101.rail_is_on(l, 14) == None)
+    test.assert(axp2101.rail_is_on(l, -1) == None)
+    // No answer.
+    c.st.insert(1, 0)
+    test.assert(axp2101.rail_is_on(l, 0) == None)
+    test.assert(not axp2101.rail_switch(l, 0, true))
+
+@test
+fn test_a_voltage_is_written_without_disturbing_the_other_bits() [io]
+    let c = chip()
+    let l = link(c)
+    // DCDC2 keeps its dynamic-voltage enable in bit 7: 1.2 V is 0x46.
+    test.assert_eq(axp2101.rail_set_mv(l, 1, 1200), 1200)
+    test.assert_eq(reg(c, 0x83), 0x80 | 0x46)
+    test.assert_eq(axp2101.rail_set_mv(l, 2, 1234), 1220)
+    test.assert_eq(reg(c, 0x84), 0x80 | 0x47)
+    // DCDC5 keeps its compensation bit in bit 5.
+    test.assert_eq(axp2101.rail_set_mv(l, 4, 3300), 3300)
+    test.assert_eq(reg(c, 0x86), 0x20 | 19)
+    test.assert_eq(axp2101.rail_set_mv(l, 4, 1250), 1200)
+    test.assert_eq(reg(c, 0x86), 0x20 | 0x19)
+    // The others.
+    test.assert_eq(axp2101.rail_set_mv(l, 0, 3333), 3300)
+    test.assert_eq(reg(c, 0x82), 18)
+    test.assert_eq(axp2101.rail_set_mv(l, 3, 1800), 1800)
+    test.assert_eq(reg(c, 0x85), 100)
+    test.assert_eq(axp2101.rail_set_mv(l, 5, 1800), 1800)
+    test.assert_eq(reg(c, 0x92), 13)
+    test.assert_eq(axp2101.rail_set_mv(l, 12, 3300), 3300)
+    test.assert_eq(reg(c, 0x99), 28)
+    test.assert_eq(axp2101.rail_set_mv(l, 11, 900), 900)
+    test.assert_eq(reg(c, 0x98), 8)
+    // The log of one write: read the register, write it back changed.
+    log_clear(c)
+    test.assert_eq(axp2101.rail_set_mv(l, 1, 1000), 1000)
+    test.assert(log_is(c, [1, 0x83, 1, 2, 0x83, 1, 0x80 | 50]))
+
+@test
+fn test_a_voltage_request_is_refused_when_it_cannot_be_made() [io]
+    let c = chip()
+    let l = link(c)
+    // Below the rail's range: nothing is sent.
+    log_clear(c)
+    test.assert_eq(axp2101.rail_set_mv(l, 0, 1400), -1)
+    test.assert_eq(axp2101.rail_set_mv(l, 4, 1000), -1)
+    test.assert_eq(axp2101.rail_set_mv(l, 5, 400), -1)
+    test.assert(log_is(c, []))
+    // A rail the part does not have.
+    test.assert_eq(axp2101.rail_set_mv(l, 14, 1800), -3)
+    test.assert_eq(axp2101.rail_set_mv(l, -1, 1800), -3)
+    // The read or the write refused.
+    c.st.insert(7, 1)
+    test.assert_eq(axp2101.rail_set_mv(l, 5, 1800), -2)
+    let d = chip()
+    d.st.insert(2, 1)
+    test.assert_eq(axp2101.rail_set_mv(link(d), 5, 1800), -2)
+
+@test
+fn test_a_rail_voltage_is_read_from_its_field() [io]
+    let c = chip()
+    let l = link(c)
+    // DCDC2 holds 0x80 | 0x12: the voltage is code 0x12, 680 mV, and the
+    // enable bit is not part of it.
+    test.assert_eq(axp2101.rail_mv(l, 1) ?? -1, 680)
+    // DCDC5 holds 0x20 | 0x0A: 2400 mV.
+    test.assert_eq(axp2101.rail_mv(l, 4) ?? -1, 2400)
+    test.assert_eq(axp2101.rail_mv(l, 0) ?? -1, 3200)
+    test.assert_eq(axp2101.rail_mv(l, 5) ?? -1, 1000)
+    // A reserved code, a rail outside 0 to 13, no part.
+    c.regs.insert(0x83, 0x80 | 0x7F)
+    test.assert(axp2101.rail_mv(l, 1) == None)
+    test.assert(axp2101.rail_mv(l, 14) == None)
+    test.assert(axp2101.rail_mv(l, -1) == None)
+    c.st.insert(1, 0)
+    test.assert(axp2101.rail_mv(l, 0) == None)
+
+@test
+fn test_the_rails_as_the_power_manager_names_them() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert(axp2101.rail_state_of(l, 0) == RailState.RailOn)
+    test.assert(axp2101.rail_switch(l, 0, false))
+    test.assert(axp2101.rail_state_of(l, 0) == RailState.RailOff)
+    // A rail the part does not have, and a part that does not answer, are off.
+    test.assert(axp2101.rail_state_of(l, 20) == RailState.RailOff)
+    let v = axp2101.rail_voltage_of(l, 5) ?? MilliVolts { mv: -1 }
+    test.assert_eq(v.mv, 1000)
+    test.assert(axp2101.rail_voltage_of(l, 20) == None)
+    let s = axp2101.rail_set_voltage_of(l, 5, MilliVolts { mv: 2750 }) ?? MilliVolts { mv: -1 }
+    test.assert_eq(s.mv, 2700)
+    test.assert(axp2101.rail_set_voltage_of(l, 5, MilliVolts { mv: 100 }) == None)
+    test.assert(axp2101.rail_set_voltage_of(l, 20, MilliVolts { mv: 1800 }) == None)
+
+// ── The charger ──────────────────────────────────────────────────────
+
+@test
+fn test_the_charge_current_codes_follow_the_data_sheet() [io]
+    // § 6.13.2.60: 25 x N up to 200 mA, then 200 + 100 x (N - 8) to 1000.
+    test.assert_eq(axp2101.icc_ma_of_code(0), 0)
+    test.assert_eq(axp2101.icc_ma_of_code(1), -1)
+    test.assert_eq(axp2101.icc_ma_of_code(3), -1)
+    test.assert_eq(axp2101.icc_ma_of_code(4), 100)
+    test.assert_eq(axp2101.icc_ma_of_code(5), 125)
+    test.assert_eq(axp2101.icc_ma_of_code(8), 200)
+    test.assert_eq(axp2101.icc_ma_of_code(9), 300)
+    test.assert_eq(axp2101.icc_ma_of_code(11), 500)
+    test.assert_eq(axp2101.icc_ma_of_code(15), 900)
+    test.assert_eq(axp2101.icc_ma_of_code(16), 1000)
+    test.assert_eq(axp2101.icc_ma_of_code(17), -1)
+    test.assert_eq(axp2101.icc_ma_of_code(31), -1)
+    // The code of a request is the highest step at or below it.
+    test.assert_eq(axp2101.icc_code_of_ma(0), 0)
+    test.assert_eq(axp2101.icc_code_of_ma(50), -1)
+    test.assert_eq(axp2101.icc_code_of_ma(99), -1)
+    test.assert_eq(axp2101.icc_code_of_ma(-5), -1)
+    test.assert_eq(axp2101.icc_code_of_ma(100), 4)
+    test.assert_eq(axp2101.icc_code_of_ma(190), 7)
+    test.assert_eq(axp2101.icc_code_of_ma(200), 8)
+    test.assert_eq(axp2101.icc_code_of_ma(299), 8)
+    test.assert_eq(axp2101.icc_code_of_ma(300), 9)
+    test.assert_eq(axp2101.icc_code_of_ma(1000), 16)
+    test.assert_eq(axp2101.icc_code_of_ma(2000), 16)
+    for n in 0..17
+        let ma = axp2101.icc_ma_of_code(n)
+        if ma >= 0
+            test.assert_eq(axp2101.icc_code_of_ma(ma), n)
+
+@test
+fn test_the_charge_current_is_set_and_read() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(axp2101.charge_current_read(l) ?? -1, 500)
+    test.assert_eq(axp2101.charge_current_set(l, 350), 300)
+    test.assert_eq(reg(c, 0x62), 9)
+    test.assert_eq(axp2101.charge_current_read(l) ?? -1, 300)
+    test.assert_eq(axp2101.charge_current_set(l, 1500), 1000)
+    test.assert_eq(axp2101.charge_current_set(l, 0), 0)
+    // A request no step reaches is refused with nothing written.
+    log_clear(c)
+    test.assert_eq(axp2101.charge_current_set(l, 60), -1)
+    test.assert(log_is(c, []))
+    // A reserved code reads as nothing; the bits above the field are not part
+    // of it.
+    c.regs.insert(0x62, 0x20 | 0x03)
+    test.assert(axp2101.charge_current_read(l) == None)
+    c.regs.insert(0x62, 0xE0 | 0x0A)
+    test.assert_eq(axp2101.charge_current_read(l) ?? -1, 400)
+    let d = chip()
+    d.st.insert(2, 1)
+    test.assert_eq(axp2101.charge_current_set(link(d), 500), -2)
+    d.st.insert(1, 0)
+    test.assert(axp2101.charge_current_read(link(d)) == None)
+
+@test
+fn test_the_precharge_and_termination_currents() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(axp2101.precharge_current_set(l, 125), 125)
+    test.assert_eq(reg(c, 0x61), 5)
+    test.assert_eq(axp2101.precharge_current_set(l, 140), 125)
+    test.assert_eq(axp2101.precharge_current_set(l, 900), 200)
+    test.assert_eq(reg(c, 0x61), 8)
+    test.assert_eq(axp2101.precharge_current_set(l, 0), 0)
+    test.assert_eq(axp2101.precharge_current_set(l, -1), -1)
+    test.assert_eq(axp2101.precharge_current_read(l) ?? -1, 0)
+    c.regs.insert(0x61, 0xF0 | 0x05)
+    test.assert_eq(axp2101.precharge_current_read(l) ?? -1, 125)
+    c.regs.insert(0x61, 0x09)
+    test.assert(axp2101.precharge_current_read(l) == None)
+    // Termination: the enable bit and 25 x N; the bits above are kept.
+    c.regs.insert(0x63, 0xE0 | 0x05)
+    test.assert_eq(axp2101.termination_set(l, 100), 100)
+    test.assert_eq(reg(c, 0x63), 0xE0 | 0x10 | 4)
+    test.assert_eq(axp2101.termination_set(l, 900), 200)
+    test.assert_eq(reg(c, 0x63), 0xE0 | 0x10 | 8)
+    test.assert_eq(axp2101.termination_set(l, 0), 0)
+    test.assert_eq(reg(c, 0x63), 0xE0 | 8)
+    test.assert_eq(axp2101.termination_set(l, -1), -1)
+    // Refused writes.
+    let d = chip()
+    d.st.insert(2, 1)
+    test.assert_eq(axp2101.precharge_current_set(link(d), 100), -2)
+    let e = chip()
+    e.st.insert(2, 1)
+    test.assert_eq(axp2101.termination_set(link(e), 100), -2)
+    let f = chip()
+    f.st.insert(2, 1)
+    test.assert_eq(axp2101.termination_set(link(f), 0), -2)
+    f.st.insert(1, 0)
+    test.assert(axp2101.precharge_current_read(link(f)) == None)
+
+@test
+fn test_the_charge_voltage_is_one_of_five_and_never_5_volts() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(axp2101.charge_voltage_read(l) ?? -1, 4200)
+    test.assert(axp2101.charge_voltage_set(l, 4350))
+    test.assert_eq(reg(c, 0x64), 4)
+    test.assert_eq(axp2101.charge_voltage_read(l) ?? -1, 4350)
+    test.assert(axp2101.charge_voltage_set(l, 4000))
+    test.assert_eq(reg(c, 0x64), 1)
+    test.assert(axp2101.charge_voltage_set(l, 4100))
+    test.assert_eq(reg(c, 0x64), 2)
+    test.assert(axp2101.charge_voltage_set(l, 4400))
+    test.assert_eq(reg(c, 0x64), 5)
+    test.assert(axp2101.charge_voltage_set(l, 4200))
+    test.assert_eq(reg(c, 0x64), 3)
+    // 5.0 V is code 0, and the other values are not steps: refused, with
+    // nothing written.
+    log_clear(c)
+    test.assert(not axp2101.charge_voltage_set(l, 5000))
+    test.assert(not axp2101.charge_voltage_set(l, 4250))
+    test.assert(not axp2101.charge_voltage_set(l, 0))
+    test.assert(log_is(c, []))
+    // Each code reads as its voltage.
+    for case in [[1, 4000], [2, 4100], [3, 4200], [4, 4350], [5, 4400]]
+        c.regs.insert(0x64, case[0])
+        test.assert_eq(axp2101.charge_voltage_read(l) ?? -1, case[1])
+        test.assert_eq(axp2101.cv_code_of_mv(case[1]), case[0])
+    // Code 0 and the reserved codes read as nothing.
+    c.regs.insert(0x64, 0)
+    test.assert(axp2101.charge_voltage_read(l) == None)
+    c.regs.insert(0x64, 6)
+    test.assert(axp2101.charge_voltage_read(l) == None)
+    c.regs.insert(0x64, 0xF8 | 1)
+    test.assert_eq(axp2101.charge_voltage_read(l) ?? -1, 4000)
+    c.st.insert(1, 0)
+    test.assert(axp2101.charge_voltage_read(l) == None)
+
+@test
+fn test_the_cell_and_button_charging_switches() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert(axp2101.charge_enable(l, false))
+    test.assert_eq(reg(c, 0x18), 0x08)
+    test.assert(axp2101.charge_enable(l, true))
+    test.assert_eq(reg(c, 0x18), 0x0A)
+    test.assert(axp2101.button_charge_enable(l, true))
+    test.assert_eq(reg(c, 0x18), 0x0E)
+    test.assert(axp2101.button_charge_enable(l, false))
+    test.assert_eq(reg(c, 0x18), 0x0A)
+    // The button cell's termination voltage, 2600 to 3300 mV.
+    test.assert_eq(axp2101.button_charge_voltage_set(l, 2600), 2600)
+    test.assert_eq(reg(c, 0x6A), 0)
+    test.assert_eq(axp2101.button_charge_voltage_set(l, 3150), 3100)
+    test.assert_eq(reg(c, 0x6A), 5)
+    test.assert_eq(axp2101.button_charge_voltage_set(l, 5000), 3300)
+    test.assert_eq(reg(c, 0x6A), 7)
+    test.assert_eq(axp2101.button_charge_voltage_set(l, 2500), -1)
+    let d = chip()
+    d.st.insert(2, 1)
+    test.assert_eq(axp2101.button_charge_voltage_set(link(d), 3000), -2)
+
+@test
+fn test_the_ts_pin_is_a_thermistor_or_an_external_input() [io]
+    let c = chip()
+    let l = link(c)
+    // The pin as an external input: bit 4 set, the current source off, the
+    // TS ADC channel off.
+    test.assert(axp2101.ts_pin_set(l, false))
+    test.assert_eq(reg(c, 0x50) & 0x1F, 0x12)
+    test.assert_eq(reg(c, 0x30) & 0x02, 0)
+    // The pin as the battery thermistor input: bit 4 clear, the current
+    // source on while the channel converts, 50 uA, the channel on.
+    test.assert(axp2101.ts_pin_set(l, true))
+    test.assert_eq(reg(c, 0x50) & 0x1F, 0x06)
+    test.assert_eq(reg(c, 0x30) & 0x02, 0x02)
+    // The bits above the field are kept.
+    c.regs.insert(0x50, 0xE0)
+    test.assert(axp2101.ts_pin_set(l, false))
+    test.assert_eq(reg(c, 0x50), 0xE0 | 0x12)
+    // A refused write at either step.
+    for n in 1..3
+        let d = chip()
+        d.st.insert(2, n)
+        test.assert(not axp2101.ts_pin_set(link(d), true))
+        let e = chip()
+        e.st.insert(2, n)
+        test.assert(not axp2101.ts_pin_set(link(e), false))
+
+// ── The watchdog ─────────────────────────────────────────────────────
+
+@test
+fn test_the_watchdog_timeout_is_a_power_of_two_of_seconds() [io]
+    test.assert_eq(axp2101.watchdog_code(1), 0)
+    test.assert_eq(axp2101.watchdog_code(2), 1)
+    test.assert_eq(axp2101.watchdog_code(3), 2)
+    test.assert_eq(axp2101.watchdog_code(4), 2)
+    test.assert_eq(axp2101.watchdog_code(5), 3)
+    test.assert_eq(axp2101.watchdog_code(16), 4)
+    test.assert_eq(axp2101.watchdog_code(17), 5)
+    test.assert_eq(axp2101.watchdog_code(64), 6)
+    test.assert_eq(axp2101.watchdog_code(128), 7)
+    test.assert_eq(axp2101.watchdog_code(1000), 7)
+    test.assert_eq(axp2101.watchdog_code(0), -1)
+    test.assert_eq(axp2101.watchdog_code(-4), -1)
+
+@test
+fn test_the_watchdog_is_started_fed_and_stopped() [io]
+    let c = chip()
+    let l = link(c)
+    // 5 s is 8 s, code 3, with the action 1: interrupt and system reset.
+    test.assert_eq(axp2101.watchdog_start(l, 5, 1), 8)
+    test.assert_eq(reg(c, 0x19), 0x10 | 0x03)
+    test.assert_eq(reg(c, 0x18) & 1, 1)
+    test.assert(axp2101.watchdog_feed(l))
+    test.assert_eq(at(c.st, 13), 1)
+    test.assert_eq(reg(c, 0x19), 0x13)
+    test.assert(axp2101.watchdog_stop(l))
+    test.assert_eq(reg(c, 0x18) & 1, 0)
+    test.assert_eq(axp2101.watchdog_start(l, 128, 3), 128)
+    test.assert_eq(reg(c, 0x19), 0x30 | 0x07)
+    // Out of range.
+    log_clear(c)
+    test.assert_eq(axp2101.watchdog_start(l, 0, 0), -1)
+    test.assert_eq(axp2101.watchdog_start(l, 4, 4), -1)
+    test.assert_eq(axp2101.watchdog_start(l, 4, -1), -1)
+    test.assert(log_is(c, []))
+    // The first or the second write refused.
+    for n in 1..3
+        let d = chip()
+        d.st.insert(2, n)
+        test.assert_eq(axp2101.watchdog_start(link(d), 4, 0), -2)
+
+// ── Interrupts ───────────────────────────────────────────────────────
+
+@test
+fn test_the_interrupt_sources_have_their_bits() [io]
+    // The bits of the data sheet's status registers 0x48 to 0x4A, §
+    // 6.13.2.43 to 6.13.2.45, as the 24-bit mask.
+    test.assert_eq(axp2101.AXP_IRQ_BAT_UNDER_TEMP_WORK, 0x01)
+    test.assert_eq(axp2101.AXP_IRQ_SOC_WARNING, 0x80)
+    test.assert_eq(axp2101.AXP_IRQ_KEY_RISING, 0x100)
+    test.assert_eq(axp2101.AXP_IRQ_KEY_FALLING, 0x200)
+    test.assert_eq(axp2101.AXP_IRQ_KEY_LONG, 0x400)
+    test.assert_eq(axp2101.AXP_IRQ_KEY_SHORT, 0x800)
+    test.assert_eq(axp2101.AXP_IRQ_VBUS_INSERT, 0x8000)
+    test.assert_eq(axp2101.AXP_IRQ_BAT_OVER_VOLTAGE, 0x10000)
+    test.assert_eq(axp2101.AXP_IRQ_CHARGE_DONE, 0x100000)
+    test.assert_eq(axp2101.AXP_IRQ_LDO_OVER_CURRENT, 0x400000)
+    test.assert_eq(axp2101.AXP_IRQ_WATCHDOG_EXPIRE, 0x800000)
+    // Every source once, and the reserved bit 21 not at all.
+    var all = 0
+    for b in [0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000, 0x40000, 0x80000, 0x100000, 0x400000, 0x800000]
+        all = all | b
+    test.assert_eq(all, axp2101.AXP_IRQ_ALL)
+    test.assert_eq(all & 0x200000, 0)
+
+@test
+fn test_the_sources_that_raise_the_pin_are_set_in_three_registers() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert(axp2101.irq_enable_set(l, 0x0C0C00))
+    test.assert_eq(reg(c, 0x40), 0x00)
+    test.assert_eq(reg(c, 0x41), 0x0C)
+    test.assert_eq(reg(c, 0x42), 0x0C)
+    test.assert(log_is(c, [2, 0x40, 3, 0x00, 0x0C, 0x0C]))
+    test.assert_eq(axp2101.irq_enabled(l), 0x0C0C00)
+    // The reserved bit is never written.
+    test.assert(axp2101.irq_enable_set(l, 0xFFFFFF))
+    test.assert_eq(axp2101.irq_enabled(l), 0xDFFFFF)
+    test.assert(axp2101.irq_enable_set(l, 0))
+    // Adding and removing leaves the rest.
+    test.assert(axp2101.irq_enable(l, axp2101.AXP_IRQ_KEY_SHORT | axp2101.AXP_IRQ_KEY_LONG, true))
+    test.assert_eq(axp2101.irq_enabled(l), 0xC00)
+    test.assert(axp2101.irq_enable(l, axp2101.AXP_IRQ_VBUS_INSERT, true))
+    test.assert_eq(axp2101.irq_enabled(l), 0x8C00)
+    test.assert(axp2101.irq_enable(l, axp2101.AXP_IRQ_KEY_LONG, false))
+    test.assert_eq(axp2101.irq_enabled(l), 0x8800)
+    // No part, and a refused write.
+    let d = chip()
+    d.st.insert(1, 0)
+    test.assert_eq(axp2101.irq_enabled(link(d)), -1)
+    test.assert(not axp2101.irq_enable(link(d), 1, true))
+    let e = chip()
+    e.st.insert(2, 1)
+    test.assert(not axp2101.irq_enable_set(link(e), 1))
+
+@test
+fn test_the_flags_are_cleared_by_writing_ones() [io]
+    let c = chip()
+    let l = link(c)
+    c.regs.insert(0x48, 0x11)
+    c.regs.insert(0x49, 0x0A)
+    c.regs.insert(0x4A, 0x18)
+    test.assert_eq(axp2101.irq_status(l), 0x180A11)
+    // Only the bits of the mask are cleared; the others stay.
+    test.assert(axp2101.irq_clear(l, 0x000A01))
+    test.assert_eq(reg(c, 0x48), 0x10)
+    test.assert_eq(reg(c, 0x49), 0x00)
+    test.assert_eq(reg(c, 0x4A), 0x18)
+    test.assert(log_is(c, [1, 0x48, 3, 2, 0x48, 3, 0x01, 0x0A, 0x00]))
+    test.assert(not axp2101.irq_clear(link_noaddr(c), 1))
+    c.st.insert(1, 0)
+    test.assert_eq(axp2101.irq_status(l), -1)
+
+@test
+fn test_service_clears_exactly_what_it_read() [io]
+    let c = chip()
+    let l = link(c)
+    c.regs.insert(0x49, 0x08)
+    log_clear(c)
+    test.assert_eq(axp2101.irq_service(l), 0x0800)
+    // One read of the three registers, one write of the bytes read.
+    test.assert(log_is(c, [1, 0x48, 3, 2, 0x48, 3, 0x00, 0x08, 0x00]))
+    test.assert_eq(reg(c, 0x49), 0)
+    // Nothing set: nothing written.
+    log_clear(c)
+    test.assert_eq(axp2101.irq_service(l), 0)
+    test.assert(log_is(c, [1, 0x48, 3]))
+    // A flag that rises after the read is not cleared by the write of the
+    // bits read: the part clears only the bits written as 1.
+    c.regs.insert(0x49, 0x08)
+    let seen = axp2101.irq_status(l)
+    c.regs.insert(0x49, 0x08 | 0x04)
+    test.assert(axp2101.irq_clear(l, seen))
+    test.assert_eq(reg(c, 0x49), 0x04)
+    // A part that does not answer, or refuses the clearing.
+    let d = chip()
+    d.st.insert(1, 0)
+    test.assert_eq(axp2101.irq_service(link(d)), -1)
+    let e = chip()
+    e.regs.insert(0x48, 0x01)
+    e.st.insert(2, 1)
+    test.assert_eq(axp2101.irq_service(link(e)), -1)
+
+@test
+fn test_the_irq_pin_is_active_low() [io]
+    let c = chip()
+    test.assert_eq(axp2101.irq_level(link(c)), 1)
+    c.st.insert(19, 0)
+    test.assert_eq(axp2101.irq_level(link(c)), 0)
+    test.assert_eq(axp2101.irq_level(link_noirq(c)), -1)
+
+// ── The power key and power-off ──────────────────────────────────────
+
+@test
+fn test_the_power_key_times_are_the_shortest_not_below_the_request() [io]
+    let c = chip()
+    let l = link(c)
+    // 0x27 power-up value: IRQLEVEL 1.5 s, OFFLEVEL 6 s.
+    c.regs.insert(0x27, 0x14 | 0x01)
+    test.assert_eq(axp2101.key_long_press_set(l, 1000), 1000)
+    test.assert_eq(reg(c, 0x27), 0x05)
+    test.assert_eq(axp2101.key_long_press_set(l, 1200), 1500)
+    test.assert_eq(axp2101.key_long_press_set(l, 1800), 2000)
+    test.assert_eq(axp2101.key_long_press_set(l, 2200), 2500)
+    test.assert_eq(axp2101.key_long_press_set(l, 9000), 2500)
+    test.assert_eq(reg(c, 0x27), 0x30 | 0x04 | 0x01)
+    test.assert_eq(axp2101.key_off_time_set(l, 4), 4)
+    test.assert_eq(axp2101.key_off_time_set(l, 5), 6)
+    test.assert_eq(axp2101.key_off_time_set(l, 7), 8)
+    test.assert_eq(axp2101.key_off_time_set(l, 9), 10)
+    test.assert_eq(axp2101.key_off_time_set(l, 99), 10)
+    test.assert_eq(reg(c, 0x27), 0x30 | 0x0C | 0x01)
+    test.assert_eq(axp2101.key_on_time_set(l, 100), 128)
+    test.assert_eq(axp2101.key_on_time_set(l, 200), 512)
+    test.assert_eq(axp2101.key_on_time_set(l, 600), 1000)
+    test.assert_eq(axp2101.key_on_time_set(l, 1500), 2000)
+    test.assert_eq(axp2101.key_on_time_set(l, 9999), 2000)
+    test.assert_eq(reg(c, 0x27), 0x30 | 0x0C | 0x03)
+    // The boundaries of each table: a step holds its own value and the next
+    // value goes to the next step.
+    for case in [[1000, 1000], [1001, 1500], [1500, 1500], [1501, 2000], [2000, 2000], [2001, 2500]]
+        test.assert_eq(axp2101.key_long_press_set(l, case[0]), case[1])
+    for case in [[4, 4], [5, 6], [6, 6], [7, 8], [8, 8], [9, 10], [10, 10]]
+        test.assert_eq(axp2101.key_off_time_set(l, case[0]), case[1])
+    for case in [[128, 128], [129, 512], [512, 512], [513, 1000], [1000, 1000], [1001, 2000], [2000, 2000]]
+        test.assert_eq(axp2101.key_on_time_set(l, case[0]), case[1])
+    // Each setting leaves the other two fields.
+    test.assert_eq(axp2101.key_on_time_set(l, 128), 128)
+    test.assert_eq(reg(c, 0x27), 0x30 | 0x0C)
+    // A refused write.
+    let d = chip()
+    d.st.insert(2, 1)
+    test.assert_eq(axp2101.key_long_press_set(link(d), 1000), -2)
+    let e = chip()
+    e.st.insert(2, 1)
+    test.assert_eq(axp2101.key_off_time_set(link(e), 4), -2)
+    let f = chip()
+    f.st.insert(2, 1)
+    test.assert_eq(axp2101.key_on_time_set(link(f), 128), -2)
+
+@test
+fn test_the_power_key_can_switch_the_system_off_or_restart_it() [io]
+    let c = chip()
+    let l = link(c)
+    c.regs.insert(0x22, 0x04)
+    test.assert(axp2101.key_power_off_set(l, true, false))
+    test.assert_eq(reg(c, 0x22), 0x04 | 0x02)
+    test.assert(axp2101.key_power_off_set(l, true, true))
+    test.assert_eq(reg(c, 0x22), 0x04 | 0x03)
+    test.assert(axp2101.key_power_off_set(l, false, false))
+    test.assert_eq(reg(c, 0x22), 0x04)
+
+@test
+fn test_power_off_and_restart_are_bits_that_clear_themselves() [io]
+    let c = chip()
+    let l = link(c)
+    c.regs.insert(0x10, 0x30 | 0x04)
+    test.assert(axp2101.power_off(l))
+    test.assert_eq(at(c.st, 10), 1)
+    test.assert_eq(at(c.st, 11), 0)
+    // The other settings of the register stay.
+    test.assert_eq(reg(c, 0x10), 0x30 | 0x04)
+    test.assert(log_is(c, [1, 0x10, 1, 2, 0x10, 1, 0x35]))
+    test.assert(axp2101.restart(l))
+    test.assert_eq(at(c.st, 11), 1)
+    test.assert_eq(at(c.st, 10), 1)
+    // The part not acknowledging.
+    c.st.insert(1, 0)
+    test.assert(not axp2101.power_off(l))
+    test.assert(not axp2101.restart(l))
+
+// ── The part on a board ──────────────────────────────────────────────
+
+@test
+fn test_the_part_on_a_board_answers_as_absent_hardware() [io]
+    // The host's board handles drive no hardware: every transfer is refused,
+    // so each method answers as for a part that does not acknowledge.
+    let p = Axp2101.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x34), 9))
+    test.assert_eq(p.begin(), -1)
+    test.assert(p.percent() == None)
+    test.assert(p.battery_mv() == None)
+    test.assert(p.vbus_millivolts() == None)
+    test.assert(p.vsys_millivolts() == None)
+    test.assert(p.die_temp() == None)
+    test.assert(p.charge() == ChargeState.ChargeFault)
+    test.assert_eq(p.set_charge_current(500), -2)
+    test.assert(not p.set_charge_voltage(4200))
+    test.assert(not p.set_charging(true))
+    test.assert_eq(p.set_rail_mv(5, 1800), -2)
+    test.assert_eq(p.service(), -1)
+    test.assert(not p.enable_irq(1, true))
+    test.assert(p.irq_pin() >= 0)
+    test.assert(not p.shut_down())
+    test.assert(not p.reboot())
+    let lk = p.as_link()
+    test.assert_eq(lk.w.addr ?? -1, 0x34)
+    let n = Axp2101.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x34))
+    test.assert_eq(n.irq_pin(), -1)
+
+@test
+fn test_the_part_is_a_power_manager_and_identifiable() [io]
+    // The trait's methods forward to the module's functions; on the host's
+    // handles nothing answers, and they must not fail.
+    let p = Axp2101.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x34))
+    test.assert_eq(p.rail_count(), 14)
+    test.assert(p.rail_state(0) == RailState.RailOff)
+    test.assert(p.rail_voltage(0) == None)
+    test.assert(p.rail_set_voltage(0, MilliVolts { mv: 1800 }) == None)
+    test.assert(not p.rail_enable(0, true))
+    test.assert(p.battery() == None)
+    test.assert(p.power_source() == PowerSource.PowerUnknown)
+    test.assert(not p.rail_is_on(0))
+    test.assert(p.rail_current(0) == None)
+    test.assert(p.device_id() == None)

@@ -1,0 +1,1211 @@
+// axp2101 — X-Powers' AXP2101, a single-cell power-management chip with a
+// linear charger and a battery gauge, on an I2C bus, as devices-nv's
+// `PowerManager` and `Identifiable`.
+//
+// The facts below are from X-Powers' data sheet "AXP2101: Single Cell
+// NVDC PMU with E-gauge", version 1.4, 13 October 2022 (the copy that could
+// be fetched, a third-party mirror); a register is named by its address, as
+// the data sheet's section 6.13 names it.  The identification register
+// (0x03, value 0x4A) is not in that data sheet; it is from Zephyr's
+// `drivers/mfd/mfd_axp2101.c` and the XPowersLib header, which agree.  The
+// part answers at the 7-bit address 0x34 (the data sheet gives the 8-bit
+// 0x68 and 0x69).
+//
+// The register map, as this driver uses it:
+//
+//   0x00 STATUS1   VBUS good (5), BATFET open (4), battery present (3), ...
+//   0x01 STATUS2   battery current direction (6:5), charging status (2:0)
+//   0x03 CHIP_ID   0x4A (not in the data sheet)
+//   0x10 COMMON    restart (1), soft power-off (0)   both clear themselves
+//   0x18 CHG_CTRL  gauge enable (3), button cell charge (2), cell charge (1),
+//                  watchdog enable (0)
+//   0x19 WDT_CTRL  reset action (5:4), clear (3), timeout (2:0)
+//   0x1A LOW_BAT   warning level 2 (7:4), level 1 (3:0)
+//   0x22 PWROFF_EN power key as power-off source (1), restart instead (0)
+//   0x27 KEY_LEVEL IRQLEVEL (5:4), OFFLEVEL (3:2), ONLEVEL (1:0)
+//   0x30 ADC_EN    general (5), die (4), VSYS (3), VBUS (2), TS (1), VBAT (0)
+//   0x34 to 0x3D   ADC data, 14 bits, the high six bits first
+//   0x40 to 0x42   IRQ enables       0x48 to 0x4A   IRQ status, write 1 to clear
+//   0x50 TS_CTRL   TS pin as external input (4), current source (3:0)
+//   0x61 IPRECHG, 0x62 ICC, 0x63 ITERM, 0x64 CV, 0x6A button-cell voltage
+//   0x80 DCDC_EN (bits 0 to 4), 0x82 to 0x86 DCDC1 to DCDC5 voltage
+//   0x90 LDO_EN0 (ALDO1 to ALDO4, BLDO1, BLDO2, CPUSLDO, DLDO1), 0x91 DLDO2
+//   0x92 to 0x9A   ALDO1 to ALDO4, BLDO1, BLDO2, CPUSLDO, DLDO1, DLDO2 voltage
+//   0xA4 BAT_PERCENT   the gauge's percentage
+//
+// The rules of the part that shape this driver:
+//
+//  - The status bits of the interrupt registers clear when 1 is written to
+//    them, and a write of 0 does nothing.  Clearing is therefore a write of
+//    the bits handled and never a read-modify-write, which writes back, and
+//    so clears, every bit that is set.
+//  - The ADC data are 14 bits, the high six in the first register and the low
+//    eight in the next; the driver reads them in one transaction.  The top
+//    two bits of the first register of VBAT and TS are not data (they are
+//    the ADC debug select), so they are masked off and never written.
+//  - A voltage register holds other settings beside the voltage: DCDC2 and
+//    DCDC3 keep their dynamic-voltage enable in bit 7 and DCDC5 its
+//    compensation bit in bit 5.  A voltage is written with the other bits as
+//    they were read.
+//  - The charging voltage code 000 is 5.0 V, a limit for a supply and not
+//    for a lithium cell, so the driver never writes it.
+//  - With the TS pin set as the battery temperature input, a battery with no
+//    thermistor stops the charger.  The pin is an option, set to an external
+//    input unless the program says the board has a thermistor.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/mfd/mfd_axp2101.c` and `drivers/charger/charger_axp2101.c`, the
+// XPowersLib `XPowersAXP2101` of Lewis He and the `axp2101` crate 0.1.0.
+// Each fix kept is named at its site.
+//
+// The driver keeps no state: everything is read from the part when it is
+// needed.  The I2C bus and the interrupt pin enter through `AxpLink`, which
+// `Axp2101Link` implements over a board's handles and a test implements over
+// a double of the part.
+
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, PowerSource, BatteryReading, PowerManager }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let REG_STATUS1  = 0x00
+let REG_STATUS2  = 0x01
+let REG_CHIP_ID  = 0x03
+let REG_COMMON   = 0x10
+let REG_CHG_CTRL = 0x18
+let REG_WDT_CTRL = 0x19
+let REG_LOW_BAT  = 0x1A
+let REG_PWROFF_EN = 0x22
+let REG_KEY_LEVEL = 0x27
+let REG_ADC_EN   = 0x30
+let REG_ADC_VBAT = 0x34
+let REG_ADC_TS   = 0x36
+let REG_ADC_VBUS = 0x38
+let REG_ADC_VSYS = 0x3A
+let REG_ADC_TDIE = 0x3C
+let REG_IRQ_EN   = 0x40
+let REG_IRQ_ST   = 0x48
+let REG_TS_CTRL  = 0x50
+let REG_IPRECHG  = 0x61
+let REG_ICC      = 0x62
+let REG_ITERM    = 0x63
+let REG_CV       = 0x64
+let REG_BTN_CV   = 0x6A
+let REG_DCDC_EN  = 0x80
+let REG_LDO_EN0  = 0x90
+let REG_LDO_EN1  = 0x91
+let REG_BAT_PCT  = 0xA4
+
+// The value of the identification register.
+let CHIP_ID = 0x4A
+
+// STATUS1 and STATUS2.
+let ST1_VBUS_GOOD = 0x20
+let ST1_BATFET    = 0x10
+let ST1_BAT_PRESENT = 0x08
+
+// COMMON.
+let COMMON_RESTART = 0x02
+let COMMON_POWEROFF = 0x01
+
+// CHG_CTRL.
+let CHG_GAUGE   = 0x08
+let CHG_BUTTON  = 0x04
+let CHG_CELL    = 0x02
+let CHG_WDT     = 0x01
+
+// WDT_CTRL.
+let WDT_CLEAR = 0x08
+
+// The I2C clock `link_setup` asks for.
+let I2C_HZ = 400000
+
+// ── The rails ────────────────────────────────────────────────────────
+
+// The rails of `PowerManager`, numbered in the order of the data sheet's
+// registers: the five DC-DC converters, then the LDOs.  The RTC LDOs have no
+// register and are not rails.
+pub const AXP_DCDC1   = 0
+pub const AXP_DCDC2   = 1
+pub const AXP_DCDC3   = 2
+pub const AXP_DCDC4   = 3
+pub const AXP_DCDC5   = 4
+pub const AXP_ALDO1   = 5
+pub const AXP_ALDO2   = 6
+pub const AXP_ALDO3   = 7
+pub const AXP_ALDO4   = 8
+pub const AXP_BLDO1   = 9
+pub const AXP_BLDO2   = 10
+pub const AXP_CPUSLDO = 11
+pub const AXP_DLDO1   = 12
+pub const AXP_DLDO2   = 13
+
+// The number of rails.
+pub const AXP_RAILS = 14
+
+// The register that holds the enable bit of `rail`, and the bit.  The
+// DC-DC converters are bits 0 to 4 of 0x80; ALDO1 to ALDO4, BLDO1, BLDO2,
+// CPUSLDO and DLDO1 are bits 0 to 7 of 0x90, and DLDO2 is bit 0 of 0x91.
+fn enable_reg(rail: Int) -> Int
+    if rail < 5
+        return REG_DCDC_EN
+    if rail < 13
+        return REG_LDO_EN0
+    REG_LDO_EN1
+
+fn enable_bit(rail: Int) -> Int
+    if rail < 5
+        return 1 << rail
+    if rail < 13
+        return 1 << (rail - 5)
+    1
+
+// The voltage register of `rail`: 0x82 to 0x86 for the converters and 0x92 to
+// 0x9A for the LDOs.
+fn volt_reg(rail: Int) -> Int
+    if rail < 5
+        return 0x82 + rail
+    0x92 + (rail - 5)
+
+// The bits of a voltage register that hold the voltage; the other bits are
+// kept as they are read.
+fn volt_mask(rail: Int) -> Int
+    if rail == AXP_DCDC2 or rail == AXP_DCDC3 or rail == AXP_DCDC4
+        return 0x7F
+    0x1F
+
+// A linear range: its lowest voltage and its step, in millivolts, and its
+// highest code.
+fn linear_code(mv: Int, lo: Int, step: Int, top: Int) -> Int
+    if mv < lo
+        return -1
+    let c = (mv - lo) / step
+    if c > top
+        return top
+    c
+
+fn linear_mv(code: Int, lo: Int, step: Int, top: Int) -> Int
+    if code < 0 or code > top
+        return -1
+    lo + step * code
+
+// DCDC2 to DCDC4 have two ranges: 500 to 1200 mV in 10 mV steps (codes 0 to
+// 70) and 1220 to `top_mv` in 20 mV steps (codes 71 on).  A request between
+// 1200 and 1220 mV is 1200.
+fn dcdc_code(mv: Int, top: Int) -> Int
+    if mv < 500
+        return -1
+    if mv < 1220
+        let c = (mv - 500) / 10
+        if c > 70
+            return 70
+        return c
+    let c = 71 + (mv - 1220) / 20
+    if c > top
+        return top
+    c
+
+fn dcdc_mv(code: Int, top: Int) -> Int
+    if code < 0 or code > top
+        return -1
+    if code <= 70
+        return 500 + 10 * code
+    1220 + 20 * (code - 71)
+
+// DCDC5: 1400 to 3700 mV in 100 mV steps (codes 0 to 23), and 1200 mV as
+// the code 25 (0x19), a value of its own.
+fn dcdc5_code(mv: Int) -> Int
+    if mv < 1200
+        return -1
+    if mv < 1400
+        return 25
+    let c = (mv - 1400) / 100
+    if c > 23
+        return 23
+    c
+
+fn dcdc5_mv(code: Int) -> Int
+    if code == 25
+        return 1200
+    if code < 0 or code > 23
+        return -1
+    1400 + 100 * code
+
+// The register code for a request for `rail`, in millivolts: the highest
+// step at or below the request, held to the rail's top, or -1 when the
+// request is below the rail's lowest voltage or the rail is not one.  The
+// ranges are those of the data sheet's registers 0x82 to 0x86 and 0x92 to
+// 0x9A:
+//
+//   DCDC1    1500 to 3400, 100 mV      DCDC2, DCDC3  500 to 1540 (two ranges)
+//   DCDC4    500 to 1840 (two ranges)  DCDC5  1200, and 1400 to 3700, 100 mV
+//   ALDO1 to ALDO4, BLDO1, BLDO2   500 to 3500, 100 mV
+//   CPUSLDO, DLDO2   500 to 1400, 50 mV    DLDO1   500 to 3300, 100 mV
+//
+// ```novo
+// use axp2101
+//
+// fn main() [io]
+//     println("${axp2101.voltage_code(1, 1230)}")    // 71
+//     println("${axp2101.voltage_code(5, 3300)}")    // 28
+// ```
+pub fn voltage_code(rail: Int, mv: Int) -> Int
+    if rail == AXP_DCDC1
+        return linear_code(mv, 1500, 100, 19)
+    if rail == AXP_DCDC2 or rail == AXP_DCDC3
+        return dcdc_code(mv, 87)
+    if rail == AXP_DCDC4
+        return dcdc_code(mv, 102)
+    if rail == AXP_DCDC5
+        return dcdc5_code(mv)
+    if rail >= AXP_ALDO1 and rail <= AXP_BLDO2
+        return linear_code(mv, 500, 100, 30)
+    if rail == AXP_CPUSLDO or rail == AXP_DLDO2
+        return linear_code(mv, 500, 50, 18)
+    if rail == AXP_DLDO1
+        return linear_code(mv, 500, 100, 28)
+    -1
+
+// The voltage in millivolts a register code of `rail` sets, or -1 for a code
+// the data sheet calls reserved and for a rail that is not one.
+//
+// The data sheet's table for CPUSLDO and DLDO2 ends at "10011: 1.40V", which
+// is code 19, while its own range, 0.5 to 1.4 V in 50 mV steps, ends at code
+// 18.  The driver takes the range, as XPowersLib does, so code 19 is
+// reserved here.
+//
+// DLDO1 is the same kind of disagreement: the features page says 0.5 to 3.3 V
+// and the table ends at "11100: 3.3V" with 11101 reserved, while the line
+// above the table says 0.5 to 3.4 V.  The driver takes the table, 3300 mV;
+// XPowersLib allows 3400.
+pub fn voltage_of_code(rail: Int, code: Int) -> Int
+    if rail == AXP_DCDC1
+        return linear_mv(code, 1500, 100, 19)
+    if rail == AXP_DCDC2 or rail == AXP_DCDC3
+        return dcdc_mv(code, 87)
+    if rail == AXP_DCDC4
+        return dcdc_mv(code, 102)
+    if rail == AXP_DCDC5
+        return dcdc5_mv(code)
+    if rail >= AXP_ALDO1 and rail <= AXP_BLDO2
+        return linear_mv(code, 500, 100, 30)
+    if rail == AXP_CPUSLDO or rail == AXP_DLDO2
+        return linear_mv(code, 500, 50, 18)
+    if rail == AXP_DLDO1
+        return linear_mv(code, 500, 100, 28)
+    -1
+
+// ── The link ─────────────────────────────────────────────────────────
+
+// What the driver needs from the board.  `link_read` reads `n` registers
+// from `reg` in one transaction; `link_write` writes the bytes of `src` from
+// `reg` in one transaction; `link_irq` is the level of the IRQ pin, 0 when
+// the part signals, 1 when idle, and -1 for a wiring with no interrupt pin;
+// `link_setup` makes the bus and the pin ready.
+pub trait AxpLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+    fn link_irq(self) -> Int [hw]
+    fn link_setup(self) [hw]
+
+// ── Register access, over any link ───────────────────────────────────
+
+// One register, or `None` when the part does not answer.
+pub fn reg_read<L: AxpLink>(l: L, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes one register: whether the part acknowledged.
+pub fn reg_write<L: AxpLink>(l: L, reg: Int, v: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push((v & 0xFF) as u8)
+    l.link_write(reg, b)
+
+// Reads a register, replaces the bits of `mask` with those of `bits`, and
+// writes it back, so the settings that share the register stay as they were.
+// Whether the part took it.
+pub fn reg_update<L: AxpLink>(l: L, reg: Int, mask: Int, bits: Int) -> Bool [hw]
+    let Some(old) = reg_read(l, reg) else return false
+    reg_write(l, reg, (old & (0xFF ^ mask)) | (bits & mask))
+
+// A bit set or cleared in a register.
+fn set_bit<L: AxpLink>(l: L, reg: Int, bit: Int, on: Bool) -> Bool [hw]
+    if on
+        return reg_update(l, reg, bit, bit)
+    reg_update(l, reg, bit, 0)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// The identification register as a `DeviceId`, or `None` when the part does
+// not answer or answers another value.  The part has no revision field, so
+// `rev` is `None`.
+pub fn identify<L: AxpLink>(l: L) -> ?DeviceId [hw]
+    let Some(v) = reg_read(l, REG_CHIP_ID) else return None
+    if v != CHIP_ID
+        return None
+    Some(DeviceId { who: v, rev: None })
+
+// Brings the part to a known state: the identification checked, and the
+// ADC channels of the battery voltage, the supply voltage, the system voltage
+// and the die temperature switched on, which the readings of `battery` and
+// the voltage functions depend on.  The TS channel and the TS pin's function
+// are left to `ts_pin_set`.  Answers 0 when the part took it, -1 when it does
+// not answer or is another part, -2 when a write was refused.
+pub fn start<L: AxpLink>(l: L) -> Int [hw]
+    l.link_setup()
+    if identify(l) == None
+        return -1
+    if not reg_update(l, REG_ADC_EN, 0x1D, 0x1D)
+        return -2
+    0
+
+// ── Status ───────────────────────────────────────────────────────────
+
+// STATUS1 in bits 0 to 7 and STATUS2 in bits 8 to 15, read in one
+// transaction, or -1.
+pub fn status_read<L: AxpLink>(l: L) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_STATUS1, 2, var b)
+        return -1
+    (b[0] as Int) | ((b[1] as Int) << 8)
+
+// Whether VBUS, the charger input, is good (STATUS1 bit 5).
+pub fn status_vbus_good(s: Int) -> Bool
+    (s & ST1_VBUS_GOOD) != 0
+
+// Whether a battery is present (STATUS1 bit 3), by the battery detection.
+pub fn status_battery_present(s: Int) -> Bool
+    (s & ST1_BAT_PRESENT) != 0
+
+// Whether the BATFET, the switch between battery and system, is open
+// (STATUS1 bit 4).
+pub fn status_batfet_open(s: Int) -> Bool
+    (s & ST1_BATFET) != 0
+
+// The direction of the battery current (STATUS2 bits 6 and 5): 0 standby, 1
+// charging, 2 discharging.
+pub fn status_current_direction(s: Int) -> Int
+    (s >> 13) & 3
+
+// The charging status of STATUS2 bits 2 to 0 as the phase `PowerManager`
+// names: 000 trickle charge and 001 pre-charge are the precharge phase, 010
+// constant current, 011 constant voltage, 100 done, 101 not charging.  The
+// reserved codes 110 and 111 are a fault.
+//
+// ```novo
+// use axp2101
+// use dev_power.{ ChargeState }
+//
+// fn main() [io]
+//     println("${axp2101.status_charge(0x0200) == ChargeState.ChargeConstantCurrent}")   // true
+// ```
+pub fn status_charge(s: Int) -> ChargeState
+    let c = (s >> 8) & 7
+    if c <= 1
+        return ChargeState.ChargePrecharge
+    if c == 2
+        return ChargeState.ChargeConstantCurrent
+    if c == 3
+        return ChargeState.ChargeConstantVoltage
+    if c == 4
+        return ChargeState.ChargeDone
+    if c == 5
+        return ChargeState.ChargeIdle
+    ChargeState.ChargeFault
+
+// Where the system draws its power: USB (VBUS good), the battery, or no
+// source at all, when VBUS is not good and no battery is present, which a
+// program running from the backup cell may read.  `PowerUnknown` when the
+// part does not answer.
+pub fn source_read<L: AxpLink>(l: L) -> PowerSource [hw]
+    let s = status_read(l)
+    if s < 0
+        return PowerSource.PowerUnknown
+    if status_vbus_good(s)
+        return PowerSource.PowerUsb
+    if status_battery_present(s)
+        return PowerSource.PowerBattery
+    PowerSource.PowerNone
+
+// ── ADC ──────────────────────────────────────────────────────────────
+
+// A 14-bit ADC value: the high six bits of the register at `reg` and the
+// eight of the next, read in one transaction, or -1.
+//
+// Fix kept: the top two bits of the first register of VBAT and TS are the
+// ADC debug select, not data, and are masked off; Zephyr's and the Rust
+// crate's readers that take the whole byte would read a count 16384 too large
+// whenever the debug bits are set.  The register is only read here.
+pub fn adc_read<L: AxpLink>(l: L, reg: Int) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(reg, 2, var b)
+        return -1
+    (((b[0] as Int) & 0x3F) << 8) | (b[1] as Int)
+
+// The battery voltage in millivolts, 1 mV a step, or `None`.  The channel is
+// on after `start` (it is on at power-up).
+pub fn vbat_mv<L: AxpLink>(l: L) -> ?Int [hw]
+    let v = adc_read(l, REG_ADC_VBAT)
+    if v < 0
+        return None
+    Some(v)
+
+// The VBUS voltage in millivolts, or `None`.  Read it with VBUS good; with no
+// supply the channel reads what the input holds.
+pub fn vbus_mv<L: AxpLink>(l: L) -> ?Int [hw]
+    let v = adc_read(l, REG_ADC_VBUS)
+    if v < 0
+        return None
+    Some(v)
+
+// The system voltage in millivolts, or `None`.
+pub fn vsys_mv<L: AxpLink>(l: L) -> ?Int [hw]
+    let v = adc_read(l, REG_ADC_VSYS)
+    if v < 0
+        return None
+    Some(v)
+
+// The TS pin voltage in microvolts, 0.5 mV a step, or `None`.
+pub fn ts_uv<L: AxpLink>(l: L) -> ?Int [hw]
+    let v = adc_read(l, REG_ADC_TS)
+    if v < 0
+        return None
+    Some(v * 500)
+
+// The die temperature in thousandths of a degree Celsius from the raw count,
+// by XPowersLib's `22 + (7274 - raw) / 20` degrees.  The data sheet gives the
+// channel's step, 0.1 mV, and no conversion; this one is the library's.
+//
+// ```novo
+// use axp2101
+//
+// fn main() [io]
+//     println("${axp2101.die_temp_milli_c(7274)}")   // 22000
+//     println("${axp2101.die_temp_milli_c(7174)}")   // 27000
+// ```
+pub fn die_temp_milli_c(raw: Int) -> Int
+    22000 + (7274 - raw) * 50
+
+// The die temperature in thousandths of a degree Celsius, or `None`.
+pub fn die_temp_read<L: AxpLink>(l: L) -> ?Int [hw]
+    let v = adc_read(l, REG_ADC_TDIE)
+    if v < 0
+        return None
+    Some(die_temp_milli_c(v))
+
+// Switches the ADC channels of `mask` on or off: bit 0 VBAT, 1 TS, 2 VBUS, 3
+// VSYS, 4 die temperature, 5 the general-purpose channel.  Whether the part
+// took it.
+pub fn adc_channels<L: AxpLink>(l: L, mask: Int, on: Bool) -> Bool [hw]
+    if on
+        return reg_update(l, REG_ADC_EN, mask & 0x3F, mask & 0x3F)
+    reg_update(l, REG_ADC_EN, mask & 0x3F, 0)
+
+// ── Rails ────────────────────────────────────────────────────────────
+
+// Whether `rail` is enabled, or `None` for a rail outside 0 to 13 and a part
+// that does not answer.
+pub fn rail_is_on<L: AxpLink>(l: L, rail: Int) -> ?Bool [hw]
+    if rail < 0 or rail >= AXP_RAILS
+        return None
+    let Some(v) = reg_read(l, enable_reg(rail)) else return None
+    Some((v & enable_bit(rail)) != 0)
+
+// Turns `rail` on or off with a read-modify-write of its enable register,
+// which holds the other rails' bits.  Whether the part took it.
+pub fn rail_switch<L: AxpLink>(l: L, rail: Int, on: Bool) -> Bool [hw]
+    if rail < 0 or rail >= AXP_RAILS
+        return false
+    set_bit(l, enable_reg(rail), enable_bit(rail), on)
+
+// The voltage `rail` is set to, in millivolts, or `None` for a rail outside 0
+// to 13, a code the data sheet calls reserved and a part that does not answer.
+pub fn rail_mv<L: AxpLink>(l: L, rail: Int) -> ?Int [hw]
+    if rail < 0 or rail >= AXP_RAILS
+        return None
+    let Some(v) = reg_read(l, volt_reg(rail)) else return None
+    let mv = voltage_of_code(rail, v & volt_mask(rail))
+    if mv < 0
+        return None
+    Some(mv)
+
+// Sets `rail` to the highest step at or below `mv`, held to the rail's top,
+// and answers the voltage set, or -1 when the request is below the rail's
+// lowest voltage, -2 when the part refused, -3 for a rail outside 0 to 13.
+//
+// Fix kept: only the voltage field of the register is written.  DCDC2 and
+// DCDC3 keep their dynamic-voltage enable in bit 7 and DCDC5 its compensation
+// bit in bit 5; the `axp2101` crate and examples that write the whole
+// register clear them.
+pub fn rail_set_mv<L: AxpLink>(l: L, rail: Int, mv: Int) -> Int [hw]
+    if rail < 0 or rail >= AXP_RAILS
+        return -3
+    let code = voltage_code(rail, mv)
+    if code < 0
+        return -1
+    if not reg_update(l, volt_reg(rail), volt_mask(rail), code)
+        return -2
+    voltage_of_code(rail, code)
+
+// The state of `rail` as `PowerManager` names it: on, or off for a rail that is
+// off, that the part does not have, or when the part does not answer.  The
+// part has no per-rail fault flag; the over-current interrupt does not say
+// which LDO, so `RailFault` is not reported.
+pub fn rail_state_of<L: AxpLink>(l: L, rail: Int) -> RailState [hw]
+    if rail_is_on(l, rail) == Some(true)
+        return RailState.RailOn
+    RailState.RailOff
+
+// The voltage of `rail` as `PowerManager` names it, or `None` (`rail_mv`).
+pub fn rail_voltage_of<L: AxpLink>(l: L, rail: Int) -> ?MilliVolts [hw]
+    let Some(mv) = rail_mv(l, rail) else return None
+    Some(MilliVolts { mv: mv })
+
+// Sets `rail` to the highest step at or below the request and answers the
+// voltage set, or `None` for a request below the rail's range, a rail the part
+// does not have and a refused write (`rail_set_mv`).
+pub fn rail_set_voltage_of<L: AxpLink>(l: L, rail: Int, v: MilliVolts) -> ?MilliVolts [hw]
+    let set = rail_set_mv(l, rail, v.mv)
+    if set < 0
+        return None
+    Some(MilliVolts { mv: set })
+
+// ── The gauge and the battery ────────────────────────────────────────
+
+// The battery's charge in whole percent from the gauge, 0 to 100, or `None`
+// when no battery is present or the part does not answer.
+//
+// Fix kept: the percentage register reads 0 with no battery, which would
+// pass for an empty one; XPowersLib answers -1 for it, and so `None` here.
+pub fn percent_read<L: AxpLink>(l: L) -> ?Int [hw]
+    let s = status_read(l)
+    if s < 0 or not status_battery_present(s)
+        return None
+    let Some(p) = reg_read(l, REG_BAT_PCT) else return None
+    if p > 100
+        return Some(100)
+    Some(p)
+
+// What `PowerManager.battery` answers: the voltage from the ADC, the
+// charging phase from STATUS2 and the percentage from the gauge.  The part
+// measures no battery current, so the current is 0.  `None` when no battery
+// is present or the part does not answer.
+pub fn battery_read<L: AxpLink>(l: L) -> ?BatteryReading [hw]
+    let s = status_read(l)
+    if s < 0 or not status_battery_present(s)
+        return None
+    let Some(mv) = vbat_mv(l) else return None
+    let Some(p) = percent_read(l) else return None
+    Some(BatteryReading { voltage: MilliVolts { mv: mv }, current: MilliAmps { ma: 0 },
+                          charge: status_charge(s), percent: Some(p) })
+
+// Turns the fuel gauge on or off (CHG_CTRL bit 3, on at power-up).  Whether
+// the part took it.
+pub fn gauge_enable<L: AxpLink>(l: L, on: Bool) -> Bool [hw]
+    set_bit(l, REG_CHG_CTRL, CHG_GAUGE, on)
+
+// Resets the gauge (0x17 bit 3, which clears itself): the percentage is
+// learnt again.  Whether the part took it.
+pub fn gauge_reset<L: AxpLink>(l: L) -> Bool [hw]
+    reg_update(l, 0x17, 0x08, 0x08)
+
+// Sets the two low-battery warning levels, 0x1A: level 2 from 5 to 20 percent
+// and level 1 from 0 to 15, each held to its range.  Whether the part took
+// it.
+pub fn battery_warning_set<L: AxpLink>(l: L, level1: Int, level2: Int) -> Bool [hw]
+    var a = level1
+    if a < 0
+        a = 0
+    if a > 15
+        a = 15
+    var b = level2 - 5
+    if b < 0
+        b = 0
+    if b > 15
+        b = 15
+    reg_write(l, REG_LOW_BAT, (b << 4) | a)
+
+// ── The charger ──────────────────────────────────────────────────────
+
+// Turns charging of the cell on or off (CHG_CTRL bit 1, on at power-up).
+// Whether the part took it.
+pub fn charge_enable<L: AxpLink>(l: L, on: Bool) -> Bool [hw]
+    set_bit(l, REG_CHG_CTRL, CHG_CELL, on)
+
+// The constant-current charge current for a register code, in milliamps: 25 x
+// N up to 200 (N 4 to 8) and 200 + 100 x (N - 8) above it, to 1000 at 16; the
+// codes 1 to 3 and above 16 are reserved, and 0 is 0 mA.  -1 for a reserved
+// code.
+//
+// ```novo
+// use axp2101
+//
+// fn main() [io]
+//     println("${axp2101.icc_ma_of_code(8)}")    // 200
+//     println("${axp2101.icc_ma_of_code(11)}")   // 500
+// ```
+pub fn icc_ma_of_code(n: Int) -> Int
+    if n == 0
+        return 0
+    if n >= 1 and n <= 3
+        return -1
+    if n <= 8
+        return 25 * n
+    if n <= 16
+        return 200 + 100 * (n - 8)
+    -1
+
+// The register code for a charge current: the highest step at or below `ma`,
+// to 1000 mA.  0 for 0, and -1 for a request from 1 to 99 mA, which no step
+// reaches and which the driver does not round to no charging.
+pub fn icc_code_of_ma(ma: Int) -> Int
+    if ma < 0
+        return -1
+    if ma == 0
+        return 0
+    if ma < 100
+        return -1
+    if ma >= 1000
+        return 16
+    if ma <= 200
+        return ma / 25
+    8 + (ma - 200) / 100
+
+// Sets the constant-current charge current (0x62), to the highest step at or
+// below `ma`, and answers the current set in milliamps, or -1 for a request
+// the steps do not reach, -2 when the part refused.  The register's power-up
+// value is the board's, set in the part's fuses.
+pub fn charge_current_set<L: AxpLink>(l: L, ma: Int) -> Int [hw]
+    let c = icc_code_of_ma(ma)
+    if c < 0
+        return -1
+    if not reg_write(l, REG_ICC, c)
+        return -2
+    icc_ma_of_code(c)
+
+// The constant-current charge current in milliamps, or `None`.
+pub fn charge_current_read<L: AxpLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_ICC) else return None
+    let ma = icc_ma_of_code(v & 0x1F)
+    if ma < 0
+        return None
+    Some(ma)
+
+// Sets the pre-charge current (0x61), 25 x N mA for N 0 to 8, to the highest
+// step at or below `ma`, and answers the current set, or -1 for a request
+// below 0, -2 when the part refused.
+pub fn precharge_current_set<L: AxpLink>(l: L, ma: Int) -> Int [hw]
+    if ma < 0
+        return -1
+    var n = ma / 25
+    if n > 8
+        n = 8
+    if not reg_write(l, REG_IPRECHG, n)
+        return -2
+    25 * n
+
+// The pre-charge current in milliamps, or `None`.
+pub fn precharge_current_read<L: AxpLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_IPRECHG) else return None
+    let n = v & 0x0F
+    if n > 8
+        return None
+    Some(25 * n)
+
+// Sets the termination current (0x63): 25 x N mA for N 1 to 8 with the
+// termination enabled, or 0 to turn termination off, which keeps the charger
+// running until the safety timer ends it.  The other bits stay as they were.
+// Answers the current set, or -1 for a request below 0, -2 when the part
+// refused.
+pub fn termination_set<L: AxpLink>(l: L, ma: Int) -> Int [hw]
+    if ma < 0
+        return -1
+    if ma < 25
+        if not reg_update(l, REG_ITERM, 0x10, 0)
+            return -2
+        return 0
+    var n = ma / 25
+    if n > 8
+        n = 8
+    if not reg_update(l, REG_ITERM, 0x1F, 0x10 | n)
+        return -2
+    25 * n
+
+// The charge voltage limit for a register code (0x64), in millivolts: 001 is
+// 4000, 010 4100, 011 4200, 100 4350, 101 4400.  Code 000 is 5.0 V and is
+// not offered; 110 and 111 are reserved.  -1 for those.
+pub fn cv_mv_of_code(n: Int) -> Int
+    if n == 1
+        return 4000
+    if n == 2
+        return 4100
+    if n == 3
+        return 4200
+    if n == 4
+        return 4350
+    if n == 5
+        return 4400
+    -1
+
+// The code for one of the voltages above, or -1.
+pub fn cv_code_of_mv(mv: Int) -> Int
+    if mv == 4000
+        return 1
+    if mv == 4100
+        return 2
+    if mv == 4200
+        return 3
+    if mv == 4350
+        return 4
+    if mv == 4400
+        return 5
+    -1
+
+// Sets the charge voltage limit (0x64), one of 4000, 4100, 4200, 4350 and
+// 4400 mV; the power-up value is 4200.  Whether the part took it; `false`
+// for any other value, 5000 included, with no write.
+//
+// Fix kept: 5000 mV, the table's code 000, is refused: it is a limit for a
+// supply, and a lithium cell charged to it is overcharged.
+pub fn charge_voltage_set<L: AxpLink>(l: L, mv: Int) -> Bool [hw]
+    let c = cv_code_of_mv(mv)
+    if c < 0
+        return false
+    reg_write(l, REG_CV, c)
+
+// The charge voltage limit in millivolts, or `None` for a part that does not
+// answer and for code 000, the 5.0 V limit, and the reserved codes.
+pub fn charge_voltage_read<L: AxpLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_CV) else return None
+    let mv = cv_mv_of_code(v & 7)
+    if mv < 0
+        return None
+    Some(mv)
+
+// The charging phase now, as `PowerManager` names it; `ChargeFault` for a
+// part that does not answer.
+pub fn charge_state<L: AxpLink>(l: L) -> ChargeState [hw]
+    let s = status_read(l)
+    if s < 0
+        return ChargeState.ChargeFault
+    status_charge(s)
+
+// Turns charging of the button cell (the backup battery) on or off (CHG_CTRL
+// bit 2, off at power-up).  Whether the part took it.
+pub fn button_charge_enable<L: AxpLink>(l: L, on: Bool) -> Bool [hw]
+    set_bit(l, REG_CHG_CTRL, CHG_BUTTON, on)
+
+// Sets the button cell's charge termination voltage (0x6A), 2600 to 3300 mV
+// in 100 mV steps, to the highest step at or below `mv`, held to the range.
+// Answers the voltage set, or -1 below 2600, -2 when the part refused.
+pub fn button_charge_voltage_set<L: AxpLink>(l: L, mv: Int) -> Int [hw]
+    if mv < 2600
+        return -1
+    var n = (mv - 2600) / 100
+    if n > 7
+        n = 7
+    if not reg_write(l, REG_BTN_CV, n)
+        return -2
+    2600 + 100 * n
+
+// The TS pin as the battery thermistor input (`ntc` true) or as an external
+// fixed input that does not affect the charger.  For a thermistor the current
+// source is on while the TS channel is converting, at 50 uA, the data sheet's
+// value for a 10 kohm thermistor at 25 degrees, and the TS ADC channel is
+// switched on.  For the external input the current source is off and the
+// channel is switched off.  Whether the part took it.
+//
+// Fix kept: a board with no thermistor on TS must set the pin to an external
+// input, or the charger refuses to start; XPowersLib does it at start by
+// default.
+pub fn ts_pin_set<L: AxpLink>(l: L, ntc: Bool) -> Bool [hw]
+    if ntc
+        if not reg_update(l, REG_TS_CTRL, 0x1F, 0x06)
+            return false
+        return adc_channels(l, 0x02, true)
+    if not reg_update(l, REG_TS_CTRL, 0x1F, 0x12)
+        return false
+    adc_channels(l, 0x02, false)
+
+// ── The watchdog ─────────────────────────────────────────────────────
+
+// The timeout codes of WDT_CTRL bits 2 to 0, 1 s to 128 s doubling, for the
+// shortest timeout not below `secs`, held to 128.  -1 for a request below 1.
+pub fn watchdog_code(secs: Int) -> Int
+    if secs < 1
+        return -1
+    var c = 0
+    var t = 1
+    for _i in 0..7
+        if t < secs
+            t = t * 2
+            c = c + 1
+    c
+
+// Starts the watchdog: a timeout of at least `secs` seconds and the action on
+// expiry, 0 interrupt only, 1 interrupt and system reset, 2 also pull PWROK
+// low for 1 s, 3 also switch every rail off and on.  The part then needs
+// `watchdog_feed` within the timeout.  Answers the timeout set in seconds, or
+// -1 for a request below 1 second or an action outside 0 to 3, -2 when the
+// part refused.
+pub fn watchdog_start<L: AxpLink>(l: L, secs: Int, action: Int) -> Int [hw]
+    let c = watchdog_code(secs)
+    if c < 0 or action < 0 or action > 3
+        return -1
+    if not reg_update(l, REG_WDT_CTRL, 0x37, (action << 4) | c)
+        return -2
+    if not set_bit(l, REG_CHG_CTRL, CHG_WDT, true)
+        return -2
+    1 << c
+
+// Feeds the watchdog (WDT_CTRL bit 3, which clears itself).  Whether the part
+// took it.
+pub fn watchdog_feed<L: AxpLink>(l: L) -> Bool [hw]
+    reg_update(l, REG_WDT_CTRL, WDT_CLEAR, WDT_CLEAR)
+
+// Stops the watchdog.  Whether the part took it.
+pub fn watchdog_stop<L: AxpLink>(l: L) -> Bool [hw]
+    set_bit(l, REG_CHG_CTRL, CHG_WDT, false)
+
+// ── Interrupts ───────────────────────────────────────────────────────
+//
+// The sources of the three interrupt registers as one 24-bit mask: register
+// 0x48 or 0x40 in bits 0 to 7, 0x49 or 0x41 in 8 to 15, and 0x4A or 0x42 in
+// 16 to 23 (§ 6.13.2.40 to 6.13.2.45).  The two state-of-charge levels are
+// named for their status bits, warning in bit 7 and shutdown in bit 6; the
+// data sheet names the enable bits level 2 and level 1.
+
+pub const AXP_IRQ_BAT_UNDER_TEMP_WORK = 0x000001
+pub const AXP_IRQ_BAT_OVER_TEMP_WORK  = 0x000002
+pub const AXP_IRQ_BAT_UNDER_TEMP_CHG  = 0x000004
+pub const AXP_IRQ_BAT_OVER_TEMP_CHG   = 0x000008
+pub const AXP_IRQ_GAUGE_NEW_SOC       = 0x000010
+pub const AXP_IRQ_GAUGE_WATCHDOG      = 0x000020
+pub const AXP_IRQ_SOC_SHUTDOWN        = 0x000040
+pub const AXP_IRQ_SOC_WARNING         = 0x000080
+pub const AXP_IRQ_KEY_RISING          = 0x000100
+pub const AXP_IRQ_KEY_FALLING         = 0x000200
+pub const AXP_IRQ_KEY_LONG            = 0x000400
+pub const AXP_IRQ_KEY_SHORT           = 0x000800
+pub const AXP_IRQ_BAT_REMOVE          = 0x001000
+pub const AXP_IRQ_BAT_INSERT          = 0x002000
+pub const AXP_IRQ_VBUS_REMOVE         = 0x004000
+pub const AXP_IRQ_VBUS_INSERT         = 0x008000
+pub const AXP_IRQ_BAT_OVER_VOLTAGE    = 0x010000
+pub const AXP_IRQ_CHARGE_TIMER        = 0x020000
+pub const AXP_IRQ_DIE_OVER_TEMP       = 0x040000
+pub const AXP_IRQ_CHARGE_START        = 0x080000
+pub const AXP_IRQ_CHARGE_DONE         = 0x100000
+pub const AXP_IRQ_LDO_OVER_CURRENT    = 0x400000
+pub const AXP_IRQ_WATCHDOG_EXPIRE     = 0x800000
+
+// The interrupt sources the part has: the bits above, with the reserved bit
+// 21 left out.
+pub const AXP_IRQ_ALL = 0xDFFFFF
+
+// The sources that raise the IRQ pin, as the 24-bit mask, or -1.
+pub fn irq_enabled<L: AxpLink>(l: L) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_IRQ_EN, 3, var b)
+        return -1
+    (b[0] as Int) | ((b[1] as Int) << 8) | ((b[2] as Int) << 16)
+
+// Sets the sources that raise the IRQ pin to exactly `mask`, in one write of
+// the three registers.  Whether the part took it.
+pub fn irq_enable_set<L: AxpLink>(l: L, mask: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let m = mask & AXP_IRQ_ALL
+    let _ = b.push((m & 0xFF) as u8)
+    let _ = b.push(((m >> 8) & 0xFF) as u8)
+    let _ = b.push(((m >> 16) & 0xFF) as u8)
+    l.link_write(REG_IRQ_EN, b)
+
+// Adds the sources of `mask` to those that raise the IRQ pin, or removes
+// them, and leaves the rest.  Whether the part took it.
+pub fn irq_enable<L: AxpLink>(l: L, mask: Int, on: Bool) -> Bool [hw]
+    let cur = irq_enabled(l)
+    if cur < 0
+        return false
+    if on
+        return irq_enable_set(l, cur | mask)
+    irq_enable_set(l, cur & (0xFFFFFF ^ mask))
+
+// The interrupt status as the 24-bit mask, or -1.  The flags stay until they
+// are cleared.
+pub fn irq_status<L: AxpLink>(l: L) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_IRQ_ST, 3, var b)
+        return -1
+    (b[0] as Int) | ((b[1] as Int) << 8) | ((b[2] as Int) << 16)
+
+// Clears the flags of `mask`: the three registers are written with the bits
+// of the mask, in one transaction, and the part clears the bits written as
+// 1 and leaves the bits written as 0.  Whether the part took it.
+//
+// Fix kept: the flags are cleared with the bits to clear and nothing else, as
+// Zephyr's `axp2101_irq_read_and_clear` does with the bits it read.  A
+// read-modify-write would write back every set bit and so clear a flag that
+// rose after the read.
+pub fn irq_clear<L: AxpLink>(l: L, mask: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let m = mask & 0xFFFFFF
+    let _ = b.push((m & 0xFF) as u8)
+    let _ = b.push(((m >> 8) & 0xFF) as u8)
+    let _ = b.push(((m >> 16) & 0xFF) as u8)
+    l.link_write(REG_IRQ_ST, b)
+
+// Reads the status and clears exactly the flags read, in two transactions,
+// and answers them as the 24-bit mask, or -1 when the part did not answer or
+// refused the clearing.
+pub fn irq_service<L: AxpLink>(l: L) -> Int [hw]
+    let s = irq_status(l)
+    if s < 0
+        return -1
+    if s == 0
+        return 0
+    if not irq_clear(l, s)
+        return -1
+    s
+
+// The level of the IRQ pin: 0 while the part signals, 1 idle, -1 for a wiring
+// with no interrupt pin.
+pub fn irq_level<L: AxpLink>(l: L) -> Int [hw]
+    l.link_irq()
+
+// ── The power key ────────────────────────────────────────────────────
+
+// The time the key is held for the part to report a long press, 0x27 bits 5 to
+// 4: 1000, 1500, 2000 or 2500 ms, the shortest not below `ms`, held to 2500.
+// Answers the time set, or -2 when the part refused.
+pub fn key_long_press_set<L: AxpLink>(l: L, ms: Int) -> Int [hw]
+    var c = 0
+    if ms > 1000
+        c = 1
+    if ms > 1500
+        c = 2
+    if ms > 2000
+        c = 3
+    if not reg_update(l, REG_KEY_LEVEL, 0x30, c << 4)
+        return -2
+    1000 + 500 * c
+
+// The time the key is held to switch the system off, 0x27 bits 3 to 2: 4, 6,
+// 8 or 10 seconds, the shortest not below `secs`, held to 10.  Answers the
+// time set, or -2 when the part refused.
+pub fn key_off_time_set<L: AxpLink>(l: L, secs: Int) -> Int [hw]
+    var c = 0
+    if secs > 4
+        c = 1
+    if secs > 6
+        c = 2
+    if secs > 8
+        c = 3
+    if not reg_update(l, REG_KEY_LEVEL, 0x0C, c << 2)
+        return -2
+    4 + 2 * c
+
+// The time the key is held to switch the system on, 0x27 bits 1 to 0: 128,
+// 512, 1000 or 2000 ms, the shortest not below `ms`, held to 2000.  Answers
+// the time set, or -2 when the part refused.
+pub fn key_on_time_set<L: AxpLink>(l: L, ms: Int) -> Int [hw]
+    var c = 0
+    var t = 128
+    if ms > 128
+        c = 1
+        t = 512
+    if ms > 512
+        c = 2
+        t = 1000
+    if ms > 1000
+        c = 3
+        t = 2000
+    if not reg_update(l, REG_KEY_LEVEL, 0x03, c)
+        return -2
+    t
+
+// Whether a long press switches the system off (0x22 bit 1), and whether it
+// restarts the system and does not switch it off (bit 0).  Whether the part
+// took it.
+pub fn key_power_off_set<L: AxpLink>(l: L, enable: Bool, restart: Bool) -> Bool [hw]
+    var v = 0
+    if enable
+        v = v | 0x02
+    if restart
+        v = v | 0x01
+    reg_update(l, REG_PWROFF_EN, 0x03, v)
+
+// ── Power-off and restart ────────────────────────────────────────────
+
+// Switches the system off: every rail and the BATFET as the part's fuses set
+// them, by COMMON bit 0, which clears itself.  A read-modify-write, so the
+// other settings of the register stay.  The part stops answering when it has
+// taken the command, so a refusal of the write is the only failure seen.
+// Whether the part acknowledged the command.
+pub fn power_off<L: AxpLink>(l: L) -> Bool [hw]
+    reg_update(l, REG_COMMON, COMMON_POWEROFF, COMMON_POWEROFF)
+
+// Restarts the system: the rails are switched off and on and the related
+// registers reset (COMMON bit 1, which clears itself).  Whether the part
+// acknowledged the command.
+pub fn restart<L: AxpLink>(l: L) -> Bool [hw]
+    reg_update(l, REG_COMMON, COMMON_RESTART, COMMON_RESTART)
+
+// ── The link over a board's handles ──────────────────────────────────
+
+// The link over a board's I2C bus and GPIO.  The wiring names the address
+// (`w.addr`, 0x34) and, as `w.irq`, the pin the IRQ output is wired to.
+pub @value
+struct Axp2101Link
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+// The bus and pin framing as functions over the traits, so a test runs them
+// over a double of the part.
+
+// Reads `n` registers from `reg` in one transaction.
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes the bytes of `src` from `reg` in one transaction.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// The level of the IRQ pin, 1 or 0, or -1 for a wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(pins: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    pins.get(irq)
+
+// Makes the bus and the IRQ pin ready: the bus at 400 kHz, the pin an input
+// with a pull-up, since the line is open-drain and active low.
+pub fn link_ready<B: I2cBus, G: GpioOut>(bus: B, pins: G, w: DeviceWiring) [hw]
+    bus.init(I2C_HZ)
+    if let Some(irq) = w.irq
+        pins.mode(irq, 2)
+
+impl AxpLink for Axp2101Link
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read(self.bus, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, src)
+
+    fn link_irq(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn link_setup(self) [hw]
+        link_ready(self.bus, self.pins, self.w)
+
+// ── The part on a board ──────────────────────────────────────────────
+
+// An AXP2101 on a board's I2C bus at the address `w.addr`, 0x34.
+pub @value
+struct Axp2101
+    link: Axp2101Link
+
+impl Axp2101
+    // The part at `w.addr` on the board's bus, with the IRQ pin `w.irq` if
+    // the wiring has one, as a board's device table builds it.  Nothing is
+    // sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Axp2101
+        Axp2101 { link: Axp2101Link { bus: bus, pins: pins, w: w } }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Axp2101Link
+        self.link
+
+    // Checks the part and switches on the ADC channels (`start`): 0, -1 or
+    // -2.
+    fn begin(self) -> Int [hw]
+        start(self.link)
+
+    // The battery's percentage, or `None` with no battery.
+    fn percent(self) -> ?Int [hw]
+        percent_read(self.link)
+
+    // The battery, supply and system voltages in millivolts, and the die
+    // temperature in thousandths of a degree.
+    fn battery_mv(self) -> ?Int [hw]
+        vbat_mv(self.link)
+
+    fn vbus_millivolts(self) -> ?Int [hw]
+        vbus_mv(self.link)
+
+    fn vsys_millivolts(self) -> ?Int [hw]
+        vsys_mv(self.link)
+
+    fn die_temp(self) -> ?Int [hw]
+        die_temp_read(self.link)
+
+    // The charging phase.
+    fn charge(self) -> ChargeState [hw]
+        charge_state(self.link)
+
+    // The charger's settings: the constant current in milliamps, the
+    // voltage limit, charging on and off.
+    fn set_charge_current(self, ma: Int) -> Int [hw]
+        charge_current_set(self.link, ma)
+
+    fn set_charge_voltage(self, mv: Int) -> Bool [hw]
+        charge_voltage_set(self.link, mv)
+
+    fn set_charging(self, on: Bool) -> Bool [hw]
+        charge_enable(self.link, on)
+
+    // The rail voltage set, answering the voltage or a negative code
+    // (`rail_set_mv`).
+    fn set_rail_mv(self, rail: Int, mv: Int) -> Int [hw]
+        rail_set_mv(self.link, rail, mv)
+
+    // The interrupt flags read and cleared (`irq_service`), the sources
+    // enabled, and the IRQ pin.
+    fn service(self) -> Int [hw]
+        irq_service(self.link)
+
+    fn enable_irq(self, mask: Int, on: Bool) -> Bool [hw]
+        irq_enable(self.link, mask, on)
+
+    fn irq_pin(self) -> Int [hw]
+        irq_level(self.link)
+
+    // Switches the system off, or restarts it.
+    fn shut_down(self) -> Bool [hw]
+        power_off(self.link)
+
+    fn reboot(self) -> Bool [hw]
+        restart(self.link)
+
+impl PowerManager[hw] for Axp2101
+    fn rail_count(self) -> Int [hw]
+        AXP_RAILS
+
+    fn rail_state(self, rail: Int) -> RailState [hw]
+        rail_state_of(self.link, rail)
+
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts [hw]
+        rail_voltage_of(self.link, rail)
+
+    // Sets the rail to the highest step at or below the request; `None` for
+    // a request below the rail's range, a rail the part does not have, and
+    // a refused write.
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts [hw]
+        rail_set_voltage_of(self.link, rail, v)
+
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool [hw]
+        rail_switch(self.link, rail, on)
+
+    // The voltage, the charging phase and the percentage; the current is 0,
+    // since the part measures none.
+    fn battery(self) -> ?BatteryReading [hw]
+        battery_read(self.link)
+
+    fn power_source(self) -> PowerSource [hw]
+        source_read(self.link)
+
+impl Identifiable[hw] for Axp2101
+    // The identification register, 0x4A.
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.link)

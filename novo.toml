@@ -1,0 +1,23 @@
+[package]
+name        = "axp2101-nv"
+version     = "0.1.0"
+description = "A driver for X-Powers' AXP2101 power-management chip on an I2C bus: devices-nv's PowerManager over the five DC-DC and nine LDO rails with their voltage tables and enable bits, the linear charger, the battery voltage and percentage, the ADC channels, the power key, the named interrupt sources, the power-off command, and the TS pin and the watchdog as options, with Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["axp2101", "pmic", "power", "charger", "battery", "i2c", "m5stack", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/axp2101-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+[docs.pages]
+"README.md" = "Managing power with an AXP2101 from a device program"
+
+[dependencies]
+# The board's I2C bus and GPIO handles, and the I2cBus and GpioOut traits
+# they implement.
+embedded-hal-nv = "^0.3.2"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the PowerManager and Identifiable traits.
+devices-nv      = "^0.3.2"

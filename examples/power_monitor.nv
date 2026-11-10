@@ -1,0 +1,91 @@
+/* power_monitor.nv: a power monitor that prints the battery, the charger and
+ * the supply of an AXP2101 once a second, and reports the power key
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          axp2101-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is an AXP2101 on the board's first I2C bus at its address, 0x34,
+ * with a lithium cell on its battery pins, a USB supply on VBUS and its
+ * power key on PWRON.  The M5Stack CoreS3 carries such a part; the BSPs of
+ * this repository have no ESP32-S3 target, so the program is built for the
+ * Nordic and NXP development boards, with SDA and SCL wired from the board to
+ * the part and the part's IRQ output to the pin named IRQ_PIN, a GPIO number
+ * of the board (pin 29, P0.29, on an nRF52840 DK).  A line looks like
+ *
+ *     bat 3874 mV 87 %  charge cc  vbus 5012 mV  die 31250 mC
+ *
+ * the cell voltage, the gauge's percentage, the charging phase, the supply
+ * voltage and the die temperature in thousandths of a degree.  A press of the
+ * power key prints `key short` or `key long`.
+ *
+ * The program reads through devices-nv's PowerManager trait, `battery`, and
+ * asks the driver for the supply voltage and the die temperature, which the
+ * trait has no place for.  It changes no rail.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the pin, the UART and
+ * the timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840-DK and the nRF54LM20-DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints
+ * "axp2101: no answer" until a board package names one with `@hal(i2c)`.
+ * The part has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_power.{ PowerManager, ChargeState }
+use axp2101
+use axp2101.{ Axp2101 }
+
+// The part's address and the pin its IRQ output is wired to.
+const ADDR = 0x34
+const IRQ_PIN = 29
+
+// The charging phase as a word.
+fn phase(s: ChargeState) -> Str
+    match s
+        ChargeState.ChargeIdle            => "idle"
+        ChargeState.ChargePrecharge       => "pre"
+        ChargeState.ChargeConstantCurrent => "cc"
+        ChargeState.ChargeConstantVoltage => "cv"
+        ChargeState.ChargeDone            => "done"
+        ChargeState.ChargeFault           => "fault"
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, ADDR), IRQ_PIN)
+    let pmu = Axp2101.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    // The part is ready some milliseconds after its supply is up.
+    hal.timer.delay_ms(10)
+    if pmu.begin() != 0
+        hal.uart.write("axp2101: no answer\n")
+        return
+    // The two kinds of press of the power key raise the IRQ pin.
+    let _ = pmu.enable_irq(axp2101.AXP_IRQ_KEY_SHORT | axp2101.AXP_IRQ_KEY_LONG, true)
+    loop
+        match pmu.battery()
+            Some(b) =>
+                field("bat ", b.voltage.mv)
+                field(" mV ", b.percent ?? 0)
+                hal.uart.write(" %  charge ")
+                hal.uart.write(phase(b.charge))
+            None => hal.uart.write("bat none")
+        field("  vbus ", pmu.vbus_millivolts() ?? 0)
+        field(" mV  die ", pmu.die_temp() ?? 0)
+        hal.uart.write(" mC\n")
+        let flags = pmu.service()
+        if flags >= 0 and (flags & axp2101.AXP_IRQ_KEY_SHORT) != 0
+            hal.uart.write("key short\n")
+        if flags >= 0 and (flags & axp2101.AXP_IRQ_KEY_LONG) != 0
+            hal.uart.write("key long\n")
+        hal.timer.delay_ms(1000)
