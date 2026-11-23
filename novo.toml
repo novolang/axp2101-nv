@@ -1,6 +1,6 @@
 [package]
 name        = "axp2101-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for X-Powers' AXP2101 power-management chip on an I2C bus: devices-nv's PowerManager over the five DC-DC and nine LDO rails with their voltage tables and enable bits, the linear charger, the battery voltage and percentage, the ADC channels, the power key, the named interrupt sources, the power-off command, and the TS pin and the watchdog as options, with Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -17,7 +17,7 @@ novo        = ">= 0.24.0"
 [dependencies]
 # The board's I2C bus and GPIO handles, and the I2cBus and GpioOut traits
 # they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the PowerManager and Identifiable traits.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"

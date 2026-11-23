@@ -55,6 +55,7 @@ fn phase(s: ChargeState) -> Str
         ChargeState.ChargeConstantVoltage => "cv"
         ChargeState.ChargeDone            => "done"
         ChargeState.ChargeFault           => "fault"
+        ChargeState.ChargeActive          => "active"
 
 // A label and a number, written without building a string.
 fn field(label: Str, v: Int) [hw]
