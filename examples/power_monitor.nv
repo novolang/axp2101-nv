@@ -72,7 +72,7 @@ fn main() [hw]
         hal.uart.write("axp2101: no answer\n")
         return
     // The two kinds of press of the power key raise the IRQ pin.
-    let _ = pmu.enable_irq(axp2101.AXP_IRQ_KEY_SHORT | axp2101.AXP_IRQ_KEY_LONG, true)
+    pmu.enable_irq(axp2101.AXP_IRQ_KEY_SHORT | axp2101.AXP_IRQ_KEY_LONG, true)
     loop
         match pmu.battery()
             Some(b) =>
